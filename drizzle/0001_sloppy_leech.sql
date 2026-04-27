@@ -1,0 +1,1 @@
+ALTER TABLE "jobs" ADD CONSTRAINT "jobs_platform_id_platforms_id_fk" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") ON DELETE no action ON UPDATE no action;

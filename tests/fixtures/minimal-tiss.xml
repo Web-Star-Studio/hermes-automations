@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ans:mensagemTISS xmlns:ans="http://www.ans.gov.br/padroes/tiss/schemas">
+  <ans:cabecalho>
+    <ans:identificacaoTransacao>
+      <ans:tipoTransacao>ENVIO_LOTE_GUIAS</ans:tipoTransacao>
+    </ans:identificacaoTransacao>
+    <ans:Padrao>4.01.00</ans:Padrao>
+  </ans:cabecalho>
+  <ans:prestadorParaOperadora>
+    <ans:loteGuias>
+      <ans:numeroLote>12345</ans:numeroLote>
+      <ans:guiasTISS>
+        <ans:guiaSP-SADT>
+          <ans:dadosAutorizacao>
+            <ans:numeroGuiaOperadora>ABC</ans:numeroGuiaOperadora>
+          </ans:dadosAutorizacao>
+          <ans:dadosBeneficiario>
+            <ans:nomeBeneficiario>Maria Silva</ans:nomeBeneficiario>
+          </ans:dadosBeneficiario>
+          <ans:dadosSolicitante>
+            <ans:contratadoSolicitante>
+              <ans:nomeContratado>Clinica Exemplo</ans:nomeContratado>
+              <ans:codigoPrestadorNaOperadora>98765</ans:codigoPrestadorNaOperadora>
+            </ans:contratadoSolicitante>
+          </ans:dadosSolicitante>
+          <ans:valorTotal>
+            <ans:valorTotalGeral>150.00</ans:valorTotalGeral>
+          </ans:valorTotal>
+        </ans:guiaSP-SADT>
+      </ans:guiasTISS>
+    </ans:loteGuias>
+  </ans:prestadorParaOperadora>
+</ans:mensagemTISS>
