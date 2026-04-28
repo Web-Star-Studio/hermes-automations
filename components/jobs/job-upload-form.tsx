@@ -4,6 +4,7 @@ import { Check, FileArchive, Upload, X } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -12,11 +13,15 @@ import { cn } from "@/lib/utils";
 
 type FlowType = "short" | "complete";
 
-const flowOptions: Array<{
+type FlowOption = {
   value: FlowType;
   title: string;
   description: string;
-}> = [
+  disabled?: boolean;
+  badge?: string;
+};
+
+const flowOptions: FlowOption[] = [
   {
     value: "short",
     title: "Fluxo curto",
@@ -27,7 +32,9 @@ const flowOptions: Array<{
     value: "complete",
     title: "Fluxo completo",
     description:
-      "Envio com etapas adicionais antes do upload. Use quando precisar do processo estendido (em construção).",
+      "Digitação guia a guia no portal (Operadora + Tipo de Guia, etapas e procedimentos). Em desenvolvimento — habilitaremos quando o fluxo estiver estável.",
+    disabled: true,
+    badge: "Em desenvolvimento",
   },
 ];
 
@@ -119,30 +126,47 @@ export function JobUploadForm() {
             <div className="grid gap-3 md:grid-cols-2" role="radiogroup">
               {flowOptions.map((option) => {
                 const selected = option.value === flowType;
+                const disabled = option.disabled === true;
                 return (
                   <button
                     key={option.value}
                     type="button"
                     role="radio"
                     aria-checked={selected}
-                    onClick={() => setFlowType(option.value)}
+                    aria-disabled={disabled}
+                    disabled={disabled}
+                    title={disabled ? "Fluxo em desenvolvimento. Em breve." : undefined}
+                    onClick={() => {
+                      if (disabled) return;
+                      setFlowType(option.value);
+                    }}
                     className={cn(
-                      "group relative cursor-pointer rounded-md border bg-card p-4 text-left transition-colors",
-                      "hover:border-primary/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                      selected && "border-primary bg-primary/5",
+                      "group relative rounded-md border bg-card p-4 text-left transition-colors",
+                      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                      disabled
+                        ? "cursor-not-allowed opacity-60"
+                        : "cursor-pointer hover:border-primary/60",
+                      selected && !disabled && "border-primary bg-primary/5",
                     )}
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <span className="font-medium">{option.title}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">{option.title}</span>
+                        {option.badge ? (
+                          <Badge variant="outline" className="text-[10px] uppercase tracking-wide">
+                            {option.badge}
+                          </Badge>
+                        ) : null}
+                      </div>
                       <span
                         className={cn(
                           "flex size-5 items-center justify-center rounded-full border",
-                          selected
+                          selected && !disabled
                             ? "border-primary bg-primary text-primary-foreground"
                             : "border-muted-foreground/40",
                         )}
                       >
-                        {selected ? <Check className="size-3" /> : null}
+                        {selected && !disabled ? <Check className="size-3" /> : null}
                       </span>
                     </div>
                     <p className="mt-1 text-xs text-muted-foreground">{option.description}</p>
