@@ -15,6 +15,13 @@ describe("Hermes agent configuration", () => {
     expect(tools).toContain("browserbase_stagehand_session_start");
   });
 
+  it("registers granular portal-action tools", () => {
+    const tools = getOrizonBillingAgentToolNames();
+    expect(tools).toContain("openPortalSession");
+    expect(tools).toContain("runPortalActions");
+    expect(tools).toContain("closePortalSession");
+  });
+
   it("identifies as Hermes and grounds web searches publicly", () => {
     const instructions = buildOrizonBillingAgentInstructions();
 

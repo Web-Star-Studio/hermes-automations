@@ -4,7 +4,7 @@ import useSWR from "swr";
 import dynamic from "next/dynamic";
 import { useMemo, useState, useTransition } from "react";
 import { CheckCircle2, Loader2, Wrench } from "lucide-react";
-import { jobStatusLabels, jobStatusTone } from "@/lib/status";
+import { jobFlowLabels, jobStatusLabels, jobStatusTone } from "@/lib/status";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -40,10 +40,12 @@ type JobDetailResponse = {
   job: {
     id: string;
     status: keyof typeof jobStatusLabels;
+    flowType: keyof typeof jobFlowLabels;
     runId: string | null;
     errorMessage: string | null;
   };
   file: { fileName: string; size: string; checksum: string } | null;
+  files: Array<{ id: string; fileName: string; size: string; checksum: string; contentType: string }>;
   tiss: {
     standardVersion: string | null;
     transactionType: string | null;
@@ -141,10 +143,17 @@ export function JobDetail({ jobId }: { jobId: string }) {
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">{data.file?.fileName ?? "Job TISS"}</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {data.files.length > 1
+              ? `${data.files.length} arquivos TISS`
+              : data.file?.fileName ?? "Job TISS"}
+          </h1>
           <p className="text-sm text-muted-foreground">Job {data.job.id}</p>
         </div>
-        <Badge variant={jobStatusTone[data.job.status]}>{jobStatusLabels[data.job.status]}</Badge>
+        <div className="flex items-center gap-2">
+          <Badge variant="outline">{jobFlowLabels[data.job.flowType]}</Badge>
+          <Badge variant={jobStatusTone[data.job.status]}>{jobStatusLabels[data.job.status]}</Badge>
+        </div>
       </div>
 
       <Tabs defaultValue="overview">
@@ -215,6 +224,7 @@ export function JobDetail({ jobId }: { jobId: string }) {
 
             <div className="space-y-6">
               <BatchDetails expanded={expanded} />
+              <FilesAttached files={data.files} expandedFiles={expanded?.files ?? null} />
               <FinancialBreakdown expanded={expanded} totalFromHeader={data.tiss?.totalAmount ?? null} />
               <ProcedureCodes codes={expanded?.procedureCodes ?? []} totalProcedures={expanded?.procedureCount ?? 0} />
               <BeneficiariesAndGuides
@@ -249,6 +259,57 @@ export function JobDetail({ jobId }: { jobId: string }) {
         </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+function FilesAttached({
+  files,
+  expandedFiles,
+}: {
+  files: Array<{ id: string; fileName: string; size: string; contentType: string }>;
+  expandedFiles: NonNullable<TissExpanded["files"]> | null;
+}) {
+  if (files.length <= 1) return null;
+  // Match each jobFile with its parsed breakdown (when present) by filename.
+  const breakdown = new Map(
+    (expandedFiles ?? []).map((f) => [
+      f.fileName,
+      { guideCount: f.guideCount, totalAmount: f.totalAmount, batchNumber: f.batchNumber },
+    ]),
+  );
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Arquivos do envio</CardTitle>
+        <CardDescription>{files.length} arquivos serão enviados juntos no mesmo lote do portal.</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Arquivo</TableHead>
+              <TableHead>Lote</TableHead>
+              <TableHead>Guias</TableHead>
+              <TableHead className="text-right">Valor</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {files.map((file) => {
+              const bd = breakdown.get(file.fileName);
+              return (
+                <TableRow key={file.id}>
+                  <TableCell className="max-w-[280px] truncate text-sm">{file.fileName}</TableCell>
+                  <TableCell className="font-mono text-xs">{bd?.batchNumber ?? "—"}</TableCell>
+                  <TableCell>{bd?.guideCount ?? "—"}</TableCell>
+                  <TableCell className="text-right">{formatCurrency(bd?.totalAmount ?? null)}</TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
   );
 }
 

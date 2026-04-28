@@ -17,6 +17,9 @@
 /.next/
 /out/
 
+# tsx / SWC plugin cache
+/.swc/
+
 # production
 /build
 

@@ -1,4 +1,26 @@
-import type { Browser, Page } from "playwright-core";
+import type { Browser, Locator, Page } from "playwright-core";
+import { mapTissToFields } from "@/lib/ai/field-mapper";
+import { findElementWithVision } from "@/lib/ai/vision";
+import {
+  type GuideTipoId,
+  type SelectorCandidate,
+  buildGuiaUrl,
+  getElement,
+  getModal,
+  orizonAcessoUrl,
+  orizonFaturePortalMap,
+  orizonSsoLoginUrl,
+  selectElement,
+  selectModal,
+} from "@/lib/orizon/portal-map";
+import {
+  type FieldSnapshot,
+  type IntrospectedField,
+  snapshotOpenModalFields,
+  snapshotPageFields,
+} from "@/lib/orizon/runtime-introspection";
+
+// ─── Public types ─────────────────────────────────────────────────────
 
 export type OrizonTissFile = {
   fileName: string;
@@ -6,11 +28,43 @@ export type OrizonTissFile = {
   contentType: string;
 };
 
+export type OrizonProcedureToAdd = {
+  codigo: string;
+  descricao?: string | null;
+  quantidade?: string | null;
+  valorUnitario?: string | null;
+  valorTotal?: string | null;
+  dataExecucao?: string | null;
+  codigoTabela?: string | null;
+};
+
+export type OrizonGuideToFill = {
+  /** Index in the original TISS file's guides[] (used in events). */
+  index: number;
+  /** Resolved tipo id (consulta / sadt / honorario / internacao / odonto). */
+  tipoId: GuideTipoId;
+  /** Operadora ANS and IDOperadora (looked up from the dropdown's option text). */
+  operadoraAns: string;
+  /** Step-by-step values to fill (from `mapTissGuideToPortalSteps`). */
+  steps: Array<{ step: number; values: Record<string, string | number | boolean> }>;
+  /** Full procedure details for the procedimentos step. */
+  procedures?: OrizonProcedureToAdd[];
+  /** Raw TISS guide payload (for vision-driven fallback fill of unmapped fields). */
+  tissData?: Record<string, unknown>;
+  /** Display label for events. */
+  label?: string;
+};
+
 export type OrizonLoginInput = {
   username: string;
   password: string;
   jobId?: string;
-  tissFile?: OrizonTissFile;
+  flowType?: "short" | "complete";
+  /** One or more files to upload (Orizon Fature accepts up to 50 .zip per submission). */
+  tissFiles?: OrizonTissFile[];
+  /** Required when flowType === "complete". */
+  guidesToFill?: OrizonGuideToFill[];
+  visionEnabled?: boolean;
   onProgress?: (event: OrizonProgressEvent) => Promise<void> | void;
 };
 
@@ -20,7 +74,14 @@ export type OrizonProgressEvent =
   | { stage: "file_uploaded" }
   | { stage: "batches_selected" }
   | { stage: "submitted" }
-  | { stage: "confirmed" };
+  | { stage: "confirmed" }
+  | { stage: "submission_succeeded" }
+  | { stage: "digitar_guia_opened" }
+  | { stage: "guide_started"; guideIndex: number; tipoId: GuideTipoId; label?: string }
+  | { stage: "guide_step_filled"; guideIndex: number; step: number }
+  | { stage: "guide_saved"; guideIndex: number }
+  | { stage: "guide_failed"; guideIndex: number; reason: string }
+  | { stage: "vision_recovery"; intent: string; selector?: string };
 
 export type OrizonLoginResult = {
   ok: boolean;
@@ -30,10 +91,11 @@ export type OrizonLoginResult = {
   debugUrl?: string;
   message: string;
   submitted?: boolean;
+  guidesSaved?: number;
+  guidesFailed?: number;
 };
 
-const loginUrl =
-  "https://sso-fature.orizon.com.br/auth/realms/orizon-dativa/protocol/openid-connect/auth?client_id=fature_client&response_type=code&scope=openid&redirect_uri=https://sso-auth-codeflow-fature-apicast-production.api.ocppr.orizon.com.br/sso/token?user_key=32efd36b405a07b8c0e6c6cb9c582047";
+// ─── Top-level entry ──────────────────────────────────────────────────
 
 export async function loginToOrizonFature(
   input: OrizonLoginInput,
@@ -49,7 +111,7 @@ async function loginWithBrowserbase(input: OrizonLoginInput): Promise<OrizonLogi
     return {
       ok: false,
       mode: "browserbase",
-      finalUrl: loginUrl,
+      finalUrl: orizonSsoLoginUrl,
       message: "Browserbase nao configurado. Defina BROWSERBASE_API_KEY e BROWSERBASE_PROJECT_ID.",
     };
   }
@@ -64,7 +126,12 @@ async function loginWithBrowserbase(input: OrizonLoginInput): Promise<OrizonLogi
     userMetadata: {
       jobId: input.jobId ?? "unknown",
       platform: "orizon_fature",
-      purpose: input.tissFile ? "submit_tiss" : "login",
+      purpose:
+        input.flowType === "complete"
+          ? "digitar_guia"
+          : (input.tissFiles?.length ?? 0) > 0
+            ? "submit_tiss"
+            : "login",
     },
   });
   const browser = await chromium.connectOverCDP(session.connectUrl);
@@ -81,21 +148,23 @@ async function loginWithBrowserbase(input: OrizonLoginInput): Promise<OrizonLogi
   }
 }
 
+// ─── Flow orchestration ───────────────────────────────────────────────
+
 async function performFlow(
   browser: Browser,
   input: OrizonLoginInput,
 ): Promise<Omit<OrizonLoginResult, "mode">> {
   const page = await browser.newPage();
+  const visionEnabled = input.visionEnabled === true;
 
   try {
-    await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
-    await page.locator('input[name="username"], input[type="text"]').first().fill(input.username);
-    await page.locator('input[name="password"], input[type="password"]').first().fill(input.password);
-    await page.locator('button[type="submit"], input[type="submit"]').first().click();
-    await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => undefined);
+    await navigateToFatureLogin(page, visionEnabled, input.onProgress);
+    await acceptAllCookies(page, visionEnabled, input.onProgress);
 
-    const hasPasswordField = await page.locator('input[type="password"]').count();
-    if (hasPasswordField > 0) {
+    await fillCredentials(page, input.username, input.password);
+
+    const stillOnLogin = await page.locator('input[type="password"]').count();
+    if (stillOnLogin > 0) {
       return {
         ok: false,
         finalUrl: page.url(),
@@ -103,79 +172,314 @@ async function performFlow(
       };
     }
 
-    if (!input.tissFile) {
-      return {
-        ok: true,
-        finalUrl: page.url(),
-        message: "Login Orizon concluido.",
-      };
+    await acceptAllCookies(page, visionEnabled, input.onProgress);
+    await dismissComunicadoInicial(page);
+
+    const files = input.tissFiles ?? [];
+    if (files.length === 0) {
+      return { ok: true, finalUrl: page.url(), message: "Login Orizon concluido." };
     }
 
-    await dismissPopups(page);
-    await input.onProgress?.({ stage: "popup_dismissed" });
+    if (input.flowType === "complete") {
+      return await runFluxoCompleto(page, input, visionEnabled);
+    }
 
-    await openUploadPage(page);
-    await input.onProgress?.({ stage: "upload_page_opened" });
-
-    await uploadTissBatch(page, input.tissFile);
-    await input.onProgress?.({ stage: "file_uploaded" });
-
-    await selectAllBatches(page);
-    await input.onProgress?.({ stage: "batches_selected" });
-
-    await submitBatches(page);
-    await input.onProgress?.({ stage: "submitted" });
-
-    await confirmSubmission(page);
-    await input.onProgress?.({ stage: "confirmed" });
-
-    return {
-      ok: true,
-      finalUrl: page.url(),
-      message: "Lote TISS enviado para a Orizon.",
-      submitted: true,
-    };
+    return await runFluxoCurto(page, input, visionEnabled);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Falha durante envio TISS.";
-    return {
-      ok: false,
-      finalUrl: page.url(),
-      message,
-    };
+    return { ok: false, finalUrl: page.url(), message };
   } finally {
     await page.close().catch(() => undefined);
   }
 }
 
-async function dismissPopups(page: Page) {
-  // Best-effort: any modal that exposes a "Fechar" button gets clicked away.
-  const candidates = [
-    page.getByRole("button", { name: /^fechar$/i }),
-    page.getByRole("link", { name: /^fechar$/i }),
-    page.locator('button:has-text("Fechar")'),
-  ];
-  for (const locator of candidates) {
+async function runFluxoCurto(
+  page: Page,
+  input: OrizonLoginInput,
+  visionEnabled: boolean,
+): Promise<Omit<OrizonLoginResult, "mode">> {
+  await openUploadPage(page, visionEnabled, input.onProgress);
+  await input.onProgress?.({ stage: "upload_page_opened" });
+
+  await acceptSupportTerms(page);
+
+  await uploadTissBatch(page, input.tissFiles ?? []);
+  await input.onProgress?.({ stage: "file_uploaded" });
+
+  await selectAllBatches(page, visionEnabled, input.onProgress);
+  await input.onProgress?.({ stage: "batches_selected" });
+
+  await submitBatches(page, visionEnabled, input.onProgress);
+  await input.onProgress?.({ stage: "submitted" });
+
+  await confirmSubmission(page, visionEnabled, input.onProgress);
+  await input.onProgress?.({ stage: "confirmed" });
+
+  await awaitSubmissionSuccess(page, visionEnabled, input.onProgress);
+  await input.onProgress?.({ stage: "submission_succeeded" });
+
+  return {
+    ok: true,
+    finalUrl: page.url(),
+    message: "Lote TISS enviado e confirmado pela Orizon (Lotes enviados com sucesso!).",
+    submitted: true,
+  };
+}
+
+async function runFluxoCompleto(
+  page: Page,
+  input: OrizonLoginInput,
+  visionEnabled: boolean,
+): Promise<Omit<OrizonLoginResult, "mode">> {
+  await openDigitarGuiaPage(page, visionEnabled, input.onProgress);
+  await input.onProgress?.({ stage: "digitar_guia_opened" });
+  await dismissTourOverlay(page);
+
+  const guides = input.guidesToFill ?? [];
+  if (guides.length === 0) {
+    return {
+      ok: true,
+      finalUrl: page.url(),
+      message: "Página 'Digitar Guia' aberta. Nenhuma guia para preencher (guidesToFill vazio).",
+      submitted: true,
+      guidesSaved: 0,
+    };
+  }
+
+  let saved = 0;
+  let failed = 0;
+
+  for (const guide of guides) {
     try {
-      const first = locator.first();
-      if (await first.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await first.click({ timeout: 2000 });
-        await page.waitForTimeout(400);
+      await input.onProgress?.({
+        stage: "guide_started",
+        guideIndex: guide.index,
+        tipoId: guide.tipoId,
+        label: guide.label,
+      });
+      await fillAndSaveGuide(page, guide, visionEnabled, input.onProgress);
+      saved++;
+      await input.onProgress?.({ stage: "guide_saved", guideIndex: guide.index });
+
+      // After saving, navigate back to digitar_guia for the next iteration.
+      if (guide !== guides[guides.length - 1]) {
+        await page.goto(`https://portal.orizon.com.br/fature/prestador.html#/digitar_guia/`, {
+          waitUntil: "domcontentloaded",
+          timeout: 30_000,
+        });
+        await dismissTourOverlay(page);
       }
-    } catch {
-      // Ignore — popups are optional.
+    } catch (error) {
+      failed++;
+      const reason = error instanceof Error ? error.message : "erro desconhecido";
+      await input.onProgress?.({ stage: "guide_failed", guideIndex: guide.index, reason });
+      // Reset to the digitar_guia entrypoint so the next guide can start fresh.
+      await page
+        .goto(`https://portal.orizon.com.br/fature/prestador.html#/digitar_guia/`, {
+          waitUntil: "domcontentloaded",
+          timeout: 30_000,
+        })
+        .catch(() => undefined);
+      await dismissTourOverlay(page);
     }
+  }
+
+  return {
+    ok: saved > 0,
+    finalUrl: page.url(),
+    message: `Fluxo completo: ${saved} guia(s) salva(s), ${failed} falha(s).`,
+    submitted: saved > 0,
+    guidesSaved: saved,
+    guidesFailed: failed,
+  };
+}
+
+// ─── Login navigation ─────────────────────────────────────────────────
+
+async function navigateToFatureLogin(
+  page: Page,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  // We start at orizon.com.br/acesso-restrito so the session collects cookies
+  // on the root domain and the natural intermediate redirects, then click
+  // the FATURE column's "Efetuar login". showForm() in the page is async and
+  // sometimes flaky in headless — fall back to direct SSO URL on failure.
+  try {
+    await page.goto(orizonAcessoUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    await acceptAllCookies(page, visionEnabled, onProgress);
+    await clickWithVisionFallback({
+      page,
+      pageId: "solutionsSelector",
+      elementId: "fatureLogin",
+      timeoutMs: 15_000,
+      visionEnabled,
+      onProgress,
+    });
+    await page.waitForURL(/sso-fature\.orizon\.com\.br/, { timeout: 20_000 }).catch(() => undefined);
+  } catch {
+    // showForm() didn't redirect us (popup blocked, AJAX issue, etc.) — go direct.
+  }
+
+  // If we're still not on the SSO page, navigate there directly.
+  if (!/sso-fature\.orizon\.com\.br/.test(page.url())) {
+    await page.goto(orizonSsoLoginUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
   }
 }
 
-async function openUploadPage(page: Page) {
-  const link = page
-    .getByRole("link", { name: /enviar xml tiss/i })
-    .or(page.getByRole("button", { name: /enviar xml tiss/i }))
-    .or(page.locator('a:has-text("Enviar XML TISS"), button:has-text("Enviar XML TISS")'))
+async function fillCredentials(page: Page, username: string, password: string) {
+  await selectElement(page, "ssoLogin", "username").fill(username);
+  await selectElement(page, "ssoLogin", "password").fill(password);
+
+  // The SSO submit handler is async — first click sometimes no-ops, second works.
+  await selectElement(page, "ssoLogin", "submit").click({ timeout: 5_000 });
+  await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => undefined);
+
+  if (await page.locator('input[type="password"]').count()) {
+    // Retry once.
+    await selectElement(page, "ssoLogin", "submit")
+      .click({ timeout: 5_000 })
+      .catch(() => undefined);
+    await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => undefined);
+  }
+}
+
+// ─── Modal handlers ───────────────────────────────────────────────────
+
+async function acceptAllCookies(
+  page: Page,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  // Best-effort: try the map's primary action, fall back to vision if enabled.
+  if (await tryClickModalAction(page, "cookieBanner")) return;
+
+  if (!visionEnabled) return;
+
+  await visionRecoverByMap({
+    page,
+    modalId: "cookieBanner",
+    onProgress,
+    action: async (locator) => {
+      await locator.click({ timeout: 2_000 });
+      await page.waitForTimeout(400);
+    },
+  }).catch(() => undefined);
+}
+
+async function dismissComunicadoInicial(page: Page) {
+  // The Comunicado modal sits at the bottom of a long scrollable container
+  // (~1800px). Playwright .click() fails on hit-testing because the button is
+  // outside the viewport. The map flags requiresScrollAndJsClick — handle it.
+  const modal = getModal("comunicadoInicial");
+  const detect = page.locator("#mensagemInicialModalPrestador").first();
+  if (!(await detect.count().catch(() => 0))) return;
+  if (!(await detect.isVisible().catch(() => false))) return;
+
+  await page
+    .evaluate((id: string) => {
+      const btn = document.getElementById(id);
+      if (!btn) return;
+      btn.scrollIntoView({ block: "center" });
+      (btn as HTMLElement).click();
+    }, modal.primaryAction.candidates.find((c) => c.kind === "id")?.kind === "id"
+      ? (modal.primaryAction.candidates.find((c) => c.kind === "id") as { kind: "id"; id: string })
+          .id
+      : "botaoMensagemInicialModalPrestador")
+    .catch(() => undefined);
+  await page.waitForTimeout(800);
+}
+
+async function dismissTourOverlay(page: Page) {
+  // Tour overlays appear on Digitar Guia and on each guide-type's first visit.
+  // Click "Terminar" if present; ignore otherwise.
+  const terminar = page
+    .locator('button.btn-sm.btn-default')
+    .filter({ hasText: /^terminar$/i })
+    .first();
+  if (await terminar.isVisible({ timeout: 1500 }).catch(() => false)) {
+    await terminar.click({ timeout: 2_000 }).catch(() => undefined);
+    await page.waitForTimeout(400);
+  }
+}
+
+async function acceptSupportTerms(page: Page) {
+  // The "Termo de Suporte" lives on the upload page. Disabled until the modal
+  // body is scrolled to the end.
+  const checkbox = selectElement(page, "uploadTiss", "fileInput"); // present means upload page is loaded
+  await checkbox.waitFor({ state: "attached", timeout: 30_000 }).catch(() => undefined);
+
+  const termsCheckbox = page.locator("#Li_Concordo_Suporte").first();
+  if (!(await termsCheckbox.count().catch(() => 0))) return;
+
+  const dialog = page
+    .locator('[role="dialog"], [class*="modal"], [class*="Modal"]')
     .first();
 
-  await link.waitFor({ state: "visible", timeout: 30_000 });
-  await link.click();
+  for (let attempt = 0; attempt < 8; attempt++) {
+    await dialog
+      .evaluate((el: Element) => {
+        const candidates = [
+          el,
+          ...Array.from(el.querySelectorAll('[class*="modal-body"], [class*="scroll"], [class*="content"]')),
+        ];
+        for (const node of candidates) {
+          const html = node as HTMLElement;
+          if (html.scrollHeight > html.clientHeight) {
+            html.scrollTop = html.scrollHeight;
+          }
+        }
+      })
+      .catch(() => undefined);
+    await page.waitForTimeout(400);
+    const disabled = await termsCheckbox.isDisabled().catch(() => true);
+    if (!disabled) break;
+  }
+
+  await termsCheckbox.check({ force: true, timeout: 5_000 }).catch(async () => {
+    await termsCheckbox.click({ force: true, timeout: 5_000 }).catch(() => undefined);
+  });
+
+  const acceptButton = page
+    .getByRole("button", { name: /^(aceitar|aceito|continuar|concordar|prosseguir|ok)$/i })
+    .or(page.locator('button:has-text("Aceitar")'))
+    .or(page.locator('button:has-text("Continuar")'))
+    .first();
+  if (await acceptButton.isVisible({ timeout: 2_000 }).catch(() => false)) {
+    await acceptButton.click({ timeout: 5_000 }).catch(() => undefined);
+    await page.waitForTimeout(800);
+  }
+}
+
+async function tryClickModalAction(page: Page, modalId: string): Promise<boolean> {
+  const { action } = selectModal(page, modalId);
+  try {
+    if (await action.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await action.click({ timeout: 2_000 });
+      await page.waitForTimeout(400);
+      return true;
+    }
+  } catch {
+    // Fall through.
+  }
+  return false;
+}
+
+// ─── Short flow helpers ───────────────────────────────────────────────
+
+async function openUploadPage(
+  page: Page,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  await clickWithVisionFallback({
+    page,
+    pageId: "dashboard",
+    elementId: "enviarXmlTissSidebar",
+    timeoutMs: 30_000,
+    visionEnabled,
+    onProgress,
+  });
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
   await page
     .getByText(/selecione um ou mais arquivos compactados/i)
@@ -183,50 +487,852 @@ async function openUploadPage(page: Page) {
     .waitFor({ state: "visible", timeout: 30_000 });
 }
 
-async function uploadTissBatch(page: Page, file: OrizonTissFile) {
-  const fileInput = page.locator('input[type="file"]').first();
+async function uploadTissBatch(page: Page, files: OrizonTissFile[]) {
+  if (files.length === 0) {
+    throw new Error("Nenhum arquivo para enviar.");
+  }
+  const fileInput = selectElement(page, "uploadTiss", "fileInput");
   await fileInput.waitFor({ state: "attached", timeout: 30_000 });
-  await fileInput.setInputFiles({
-    name: file.fileName,
-    mimeType: file.contentType || "application/zip",
-    buffer: file.bytes,
-  });
 
-  // Wait for the validation row to appear (file name visible in the list area).
-  await page
-    .getByText(file.fileName, { exact: false })
-    .first()
-    .waitFor({ state: "visible", timeout: 60_000 });
+  // Playwright accepts an array — Orizon's input renders one row per file.
+  await fileInput.setInputFiles(
+    files.map((file) => ({
+      name: file.fileName,
+      mimeType: file.contentType || "application/zip",
+      buffer: file.bytes,
+    })),
+  );
+
+  // Wait for every file to register in the list. Orizon validates each
+  // upload server-side before showing the row, so this also confirms the
+  // batch is ready for selection / submit.
+  await Promise.all(
+    files.map((file) =>
+      page
+        .getByText(file.fileName, { exact: false })
+        .first()
+        .waitFor({ state: "visible", timeout: 60_000 }),
+    ),
+  );
 }
 
-async function selectAllBatches(page: Page) {
-  // First checkbox in the batches list = column-header select-all.
-  const checkbox = page.locator('input[type="checkbox"]').first();
-  await checkbox.waitFor({ state: "visible", timeout: 15_000 });
-  if (!(await checkbox.isChecked().catch(() => false))) {
-    await checkbox.check({ timeout: 5_000 }).catch(async () => {
-      // Some UIs hide the native input behind a label; click instead.
-      await checkbox.click({ force: true, timeout: 5_000 });
+async function selectAllBatches(
+  page: Page,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  const checkbox = selectElement(page, "uploadTiss", "selectAllCheckbox");
+  try {
+    await checkbox.waitFor({ state: "visible", timeout: 15_000 });
+    if (!(await checkbox.isChecked().catch(() => false))) {
+      await checkbox.check({ timeout: 5_000 }).catch(async () => {
+        await checkbox.click({ force: true, timeout: 5_000 });
+      });
+    }
+  } catch (error) {
+    if (!visionEnabled) throw error;
+    await visionRecoverByMap({
+      page,
+      pageId: "uploadTiss",
+      elementId: "selectAllCheckbox",
+      onProgress,
+      action: async (locator) => {
+        if (!(await locator.isChecked().catch(() => false))) {
+          await locator.click({ force: true, timeout: 5_000 });
+        }
+      },
     });
   }
 }
 
-async function submitBatches(page: Page) {
-  const enviar = page
-    .getByRole("button", { name: /^enviar$/i })
-    .or(page.locator('button:has-text("Enviar"):not(:has-text("arquivos")):not(:has-text("XML"))'))
-    .first();
-  await enviar.waitFor({ state: "visible", timeout: 15_000 });
-  await enviar.click();
+async function submitBatches(
+  page: Page,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  await clickWithVisionFallback({
+    page,
+    pageId: "uploadTiss",
+    elementId: "enviarButton",
+    timeoutMs: 15_000,
+    visionEnabled,
+    onProgress,
+  });
 }
 
-async function confirmSubmission(page: Page) {
-  const confirm = page
-    .getByRole("button", { name: /enviar arquivos v[aá]lidos/i })
-    .or(page.locator('button:has-text("Enviar arquivos válidos")'))
-    .or(page.locator('button:has-text("Enviar arquivos validos")'))
-    .first();
-  await confirm.waitFor({ state: "visible", timeout: 30_000 });
-  await confirm.click();
+async function confirmSubmission(
+  page: Page,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  await clickWithVisionFallback({
+    page,
+    pageId: "confirmBatchesModal",
+    elementId: "enviarValidosButton",
+    timeoutMs: 30_000,
+    visionEnabled,
+    onProgress,
+  });
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
+}
+
+async function awaitSubmissionSuccess(
+  page: Page,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  // After "Enviar arquivos válidos" the portal pops a success modal
+  // with title "Lotes enviados com sucesso!" and two buttons:
+  // 'Enviar mais lotes' (white) and 'Ir para Lista de Lotes' (blue).
+  // We wait for the title to confirm the submission was accepted, then
+  // click 'Enviar mais lotes' to dismiss and end the flow cleanly.
+  const successTitle = page.getByText(/lotes enviados com sucesso/i).first();
+  await successTitle.waitFor({ state: "visible", timeout: 60_000 });
+
+  const { action } = selectModal(page, "lotesEnviadosSucesso");
+  try {
+    await action.waitFor({ state: "visible", timeout: 10_000 });
+    await action.click({ timeout: 5_000 });
+    await page.waitForTimeout(600);
+  } catch (error) {
+    if (!visionEnabled) throw error;
+    await visionRecoverByMap({
+      page,
+      modalId: "lotesEnviadosSucesso",
+      onProgress,
+      action: async (locator) => {
+        await locator.click({ timeout: 5_000 });
+      },
+    });
+  }
+}
+
+// ─── Long flow helpers ───────────────────────────────────────────────
+
+async function openDigitarGuiaPage(
+  page: Page,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  await clickWithVisionFallback({
+    page,
+    pageId: "dashboard",
+    elementId: "digitarGuiasTile",
+    timeoutMs: 30_000,
+    visionEnabled,
+    onProgress,
+  });
+  await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
+  // Confirm we landed by waiting for the Operadora select.
+  await selectElement(page, "digitarGuia", "operadoraSelect").waitFor({
+    state: "visible",
+    timeout: 30_000,
+  });
+}
+
+async function selectOperadoraByAns(page: Page, ans: string | number): Promise<string> {
+  // Operadora option values are `${IDOperadora}:${ANS}`. Find the option whose
+  // visible text contains "(ANS: <ans>)" and assign it via JS so Angular picks
+  // up the change.
+  const ansStr = String(ans);
+  const result = await page.evaluate((wantedAns: string) => {
+    const sel = document.getElementById("operadora") as HTMLSelectElement | null;
+    if (!sel) return { ok: false, reason: "select not found" };
+    const re = new RegExp(`\\bANS:\\s*0*${wantedAns}\\b`, "i");
+    const opt = Array.from(sel.options).find((o) => re.test(o.textContent ?? ""));
+    if (!opt) return { ok: false, reason: `no option for ANS ${wantedAns}` };
+    sel.value = opt.value;
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    type AngularGlobal = { element?: (el: Element) => { scope?: () => { $apply?: () => void } } };
+    const ng = (window as unknown as { angular?: AngularGlobal }).angular;
+    if (ng?.element) {
+      try {
+        ng.element(sel).scope?.()?.$apply?.();
+      } catch {
+        // Ignore scope errors.
+      }
+    }
+    return { ok: true, value: opt.value, text: opt.textContent ?? "" };
+  }, ansStr);
+  if (!result.ok) {
+    throw new Error(`Operadora não encontrada para ANS ${ans}: ${result.reason}`);
+  }
+  return result.value as string;
+}
+
+async function selectTipoGuia(page: Page, tipoId: GuideTipoId) {
+  const tipo = orizonFaturePortalMap.guideTypes[tipoId];
+  await page.evaluate((value: string) => {
+    const sel = document.getElementById("tipoDeGuia") as HTMLSelectElement | null;
+    if (!sel) throw new Error("tipoDeGuia select not found");
+    sel.value = value;
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    type AngularGlobal = { element?: (el: Element) => { scope?: () => { $apply?: () => void } } };
+    const ng = (window as unknown as { angular?: AngularGlobal }).angular;
+    if (ng?.element) {
+      try {
+        ng.element(sel).scope?.()?.$apply?.();
+      } catch {
+        // Ignore.
+      }
+    }
+  }, tipo.selectValue);
+}
+
+async function clickDigitarGuiaSubmit(
+  page: Page,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  // The button's onclick navigates the SPA route. Click via JS to bypass any
+  // visual-state issues (the button is dimmed orange briefly).
+  await page.evaluate(() => {
+    const btn = document.getElementById("botaoDigitarGuia");
+    if (btn) (btn as HTMLElement).click();
+  });
+  // Wait for the route to change.
+  await page
+    .waitForURL(/#\/(guia_consulta|guia_sadt|guia_honorario|guia_internacao|guia_odonto)/, {
+      timeout: 15_000,
+    })
+    .catch(async () => {
+      // Fall back to deterministic + vision click.
+      await clickWithVisionFallback({
+        page,
+        pageId: "digitarGuia",
+        elementId: "submitButton",
+        timeoutMs: 10_000,
+        visionEnabled,
+        onProgress,
+      });
+      await page
+        .waitForURL(/#\/(guia_consulta|guia_sadt|guia_honorario|guia_internacao|guia_odonto)/, {
+          timeout: 15_000,
+        })
+        .catch(() => undefined);
+    });
+}
+
+async function fillGuideStep(
+  page: Page,
+  tipoId: GuideTipoId,
+  step: number,
+  values: Record<string, string | number | boolean>,
+  options: {
+    tissData?: Record<string, unknown>;
+    visionEnabled: boolean;
+  },
+) {
+  const tipo = orizonFaturePortalMap.guideTypes[tipoId];
+  const pageId = tipo.pageId;
+  const filledIds = new Set<string>();
+
+  // 1) Fill statically-mapped fields.
+  for (const [elementId, value] of Object.entries(values)) {
+    try {
+      const locator = selectElement(page, pageId, elementId);
+      await locator.waitFor({ state: "visible", timeout: 5_000 });
+      await fillByLocator(locator, value);
+      // Track the actual id we filled (resolves through the map's first id candidate).
+      const el = orizonFaturePortalMap.pages[pageId].elements[elementId];
+      const idCandidate = el.candidates.find((c) => c.kind === "id");
+      if (idCandidate?.kind === "id") filledIds.add(idCandidate.id);
+    } catch {
+      // Skip — runtime fallback may pick it up below.
+    }
+  }
+
+  // 2) Runtime fallback for any remaining TISS data: introspect visible
+  //    fields, ask the LLM mapper to map TISS data → fields. Only when
+  //    vision is enabled (it costs a model call).
+  if (options.visionEnabled && options.tissData && Object.keys(options.tissData).length > 0) {
+    try {
+      const snapshot = await snapshotPageFields(page);
+      const remainingFields = snapshot.fields.filter(
+        (f) => !f.disabled && !(f.id && filledIds.has(f.id)),
+      );
+      if (remainingFields.length > 0) {
+        const reduced: FieldSnapshot = { ...snapshot, fields: remainingFields };
+        const mapping = await mapTissToFields({
+          snapshot: reduced,
+          tissData: options.tissData,
+          pageContext: `${tipo.label} — etapa ${step}`,
+        });
+        for (const assignment of mapping.assignments) {
+          await applyAssignment(page, remainingFields, assignment).catch(() => undefined);
+        }
+      }
+    } catch {
+      // Silent — runtime fallback is opportunistic.
+    }
+  }
+}
+
+async function fillByLocator(
+  locator: Locator,
+  value: string | number | boolean,
+): Promise<void> {
+  const tag = await locator.evaluate((el: Element) => el.tagName).catch(() => "");
+  if (tag === "SELECT") {
+    await locator.selectOption({ value: String(value) }).catch(async () => {
+      await locator.evaluate((el: Element, v: string) => {
+        const sel = el as HTMLSelectElement;
+        sel.value = v;
+        sel.dispatchEvent(new Event("change", { bubbles: true }));
+      }, String(value));
+    });
+    return;
+  }
+  if (typeof value === "boolean") {
+    if (value) await locator.check({ force: true, timeout: 3_000 }).catch(() => undefined);
+    else await locator.uncheck({ force: true, timeout: 3_000 }).catch(() => undefined);
+    return;
+  }
+  await locator.fill(String(value), { timeout: 3_000 });
+}
+
+async function applyAssignment(
+  page: Page,
+  fields: IntrospectedField[],
+  assignment: { fieldKey: string; value: string },
+): Promise<void> {
+  const field = fields.find(
+    (f) => f.id === assignment.fieldKey || f.cssPath === assignment.fieldKey,
+  );
+  if (!field) return;
+  const selector = field.id ? `#${cssEscape(field.id)}` : field.cssPath;
+  const locator = page.locator(selector).first();
+  await locator.waitFor({ state: "visible", timeout: 3_000 }).catch(() => undefined);
+  if (field.kind === "select") {
+    await locator
+      .selectOption({ value: assignment.value })
+      .catch(async () =>
+        locator.selectOption({ label: assignment.value }).catch(() => undefined),
+      );
+    return;
+  }
+  if (field.kind === "checkbox" || field.kind === "radio") {
+    const truthy = /^(true|1|sim|yes|on|checked)$/i.test(assignment.value.trim());
+    if (truthy) await locator.check({ force: true, timeout: 3_000 }).catch(() => undefined);
+    else await locator.uncheck({ force: true, timeout: 3_000 }).catch(() => undefined);
+    return;
+  }
+  await locator.fill(assignment.value, { timeout: 3_000 }).catch(() => undefined);
+}
+
+function cssEscape(value: string): string {
+  return value.replace(/([^a-zA-Z0-9_-])/g, "\\$1");
+}
+
+async function advanceGuideStep(
+  page: Page,
+  tipoId: GuideTipoId,
+  fromStep: number,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  const tipo = orizonFaturePortalMap.guideTypes[tipoId];
+  const buttonId = tipo.nextStepButtonId(fromStep);
+  const candidates: SelectorCandidate[] = [
+    { kind: "id", id: buttonId },
+    { kind: "css", selector: 'button.orange:has-text("Próxima etapa")' },
+  ];
+  const locator = composeFromCandidates(page, candidates);
+
+  try {
+    await locator.waitFor({ state: "visible", timeout: 10_000 });
+    await locator.click({ timeout: 5_000 });
+  } catch (error) {
+    if (!visionEnabled) throw error;
+    await visionRecoverByMap({
+      page,
+      pageId: tipo.pageId,
+      elementId: "nextStepButton",
+      onProgress,
+      action: async (l) => {
+        await l.click({ timeout: 5_000 });
+      },
+    });
+  }
+  await page.waitForTimeout(600);
+}
+
+async function addProcedimento(
+  page: Page,
+  tipoId: GuideTipoId,
+  procedure: OrizonProcedureToAdd,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  const pageId = orizonFaturePortalMap.guideTypes[tipoId].pageId;
+
+  // 1) Open the procedure-add modal.
+  await clickWithVisionFallback({
+    page,
+    pageId,
+    elementId: "adicionarItem",
+    timeoutMs: 10_000,
+    visionEnabled,
+    onProgress,
+  });
+
+  // 2) Wait for the modal and snapshot it.
+  await page.waitForTimeout(600);
+  const snapshot = await snapshotOpenModalFields(page);
+  if (!snapshot) {
+    throw new Error(`Procedimento modal nao abriu para ${procedure.codigo}.`);
+  }
+
+  // 3) Try a few obvious deterministic fills first (TUSS code in any input
+  //    that mentions "código" / "TUSS" / "procedimento"). These are best-effort.
+  const codigoField = snapshot.fields.find(
+    (f) =>
+      f.kind === "text" &&
+      /(c[óo]digo|tuss|procedimento)/i.test(`${f.label} ${f.placeholder ?? ""} ${f.ngModel ?? ""}`),
+  );
+  if (codigoField) {
+    const selector = codigoField.id ? `#${cssEscape(codigoField.id)}` : codigoField.cssPath;
+    await page
+      .locator(selector)
+      .first()
+      .fill(procedure.codigo, { timeout: 3_000 })
+      .catch(() => undefined);
+    await page.waitForTimeout(800);
+    // Many TUSS lookup widgets show suggestions; press Enter to commit the typed code.
+    await page.locator(selector).first().press("Enter").catch(() => undefined);
+    await page.waitForTimeout(500);
+  }
+
+  // 4) Vision fallback for the rest of the modal — only if vision is enabled.
+  if (visionEnabled) {
+    try {
+      const refreshed = (await snapshotOpenModalFields(page)) ?? snapshot;
+      const tissData: Record<string, unknown> = {
+        codigoProcedimento: procedure.codigo,
+        descricaoProcedimento: procedure.descricao,
+        quantidade: procedure.quantidade,
+        valorUnitario: procedure.valorUnitario,
+        valorTotal: procedure.valorTotal,
+        dataExecucao: procedure.dataExecucao,
+        codigoTabela: procedure.codigoTabela,
+      };
+      const mapping = await mapTissToFields({
+        snapshot: refreshed,
+        tissData,
+        pageContext: "Modal 'Adicionar Item' / procedimento TUSS",
+      });
+      for (const assignment of mapping.assignments) {
+        await applyAssignment(page, refreshed.fields, assignment).catch(() => undefined);
+      }
+    } catch {
+      // Vision step is best-effort — fall through to the save-button click.
+    }
+  }
+
+  // 5) Click the modal's save button. Match common patterns.
+  const saveBtn = page
+    .locator('.modal.in, [role="dialog"]')
+    .getByRole("button", { name: /^(salvar|adicionar|incluir|confirmar|ok)$/i })
+    .or(page.locator('.modal.in button:has-text("Salvar")'))
+    .or(page.locator('.modal.in button:has-text("Adicionar")'))
+    .first();
+  if (await saveBtn.isVisible({ timeout: 3_000 }).catch(() => false)) {
+    await saveBtn.click({ timeout: 5_000 }).catch(() => undefined);
+    await page.waitForTimeout(800);
+  }
+}
+
+async function salvarGuia(
+  page: Page,
+  tipoId: GuideTipoId,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  const pageId = orizonFaturePortalMap.guideTypes[tipoId].pageId;
+  await clickWithVisionFallback({
+    page,
+    pageId,
+    elementId: "salvarGuia",
+    timeoutMs: 10_000,
+    visionEnabled,
+    onProgress,
+  });
+  await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
+}
+
+async function fillAndSaveGuide(
+  page: Page,
+  guide: OrizonGuideToFill,
+  visionEnabled: boolean,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  // 1) On the digitar_guia entry, select operadora + tipo and submit.
+  await selectOperadoraByAns(page, guide.operadoraAns);
+  await selectTipoGuia(page, guide.tipoId);
+  await clickDigitarGuiaSubmit(page, visionEnabled, onProgress);
+  await dismissTourOverlay(page);
+
+  const tipo = orizonFaturePortalMap.guideTypes[guide.tipoId];
+
+  // 2) Walk steps 1..N-1 (last step is procedimentos + Salvar).
+  for (let s = 1; s < tipo.stepCount; s++) {
+    const stepValues = guide.steps.find((x) => x.step === s)?.values ?? {};
+    await fillGuideStep(page, guide.tipoId, s, stepValues, {
+      tissData: guide.tissData,
+      visionEnabled,
+    });
+    await onProgress?.({ stage: "guide_step_filled", guideIndex: guide.index, step: s });
+    await advanceGuideStep(page, guide.tipoId, s, visionEnabled, onProgress);
+  }
+
+  // 3) Add procedures via the modal handler.
+  for (const procedure of guide.procedures ?? []) {
+    await addProcedimento(page, guide.tipoId, procedure, visionEnabled, onProgress).catch(() => {
+      // Per-procedure failures don't abort the whole guide — surface via vision_recovery / log.
+    });
+  }
+
+  // 4) Salvar Guia.
+  await salvarGuia(page, guide.tipoId, visionEnabled, onProgress);
+}
+
+// ─── Click & vision helpers ───────────────────────────────────────────
+
+async function clickWithVisionFallback(input: {
+  page: Page;
+  pageId: string;
+  elementId: string;
+  timeoutMs: number;
+  visionEnabled: boolean;
+  onProgress?: OrizonLoginInput["onProgress"];
+}) {
+  const primary = selectElement(input.page, input.pageId, input.elementId);
+  try {
+    await primary.waitFor({ state: "visible", timeout: input.timeoutMs });
+    await primary.click({ timeout: 5_000 });
+    return;
+  } catch (error) {
+    if (!input.visionEnabled) throw error;
+    await visionRecoverByMap({
+      page: input.page,
+      pageId: input.pageId,
+      elementId: input.elementId,
+      onProgress: input.onProgress,
+      action: async (locator) => {
+        await locator.click({ timeout: 5_000 });
+      },
+    });
+  }
+}
+
+async function visionRecoverByMap(input: {
+  page: Page;
+  pageId?: string;
+  elementId?: string;
+  modalId?: string;
+  onProgress?: OrizonLoginInput["onProgress"];
+  action: (locator: Locator) => Promise<void>;
+}) {
+  const screenshot = await input.page.screenshot({ type: "jpeg", quality: 70, fullPage: false });
+  const { intent, friendly } = resolveVisionTarget(input);
+  const guess =
+    input.pageId && input.elementId
+      ? await findElementWithVision({
+          screenshot,
+          pageId: input.pageId,
+          elementId: input.elementId,
+        })
+      : await findElementWithVision({ screenshot, intent });
+
+  if (!guess.found) {
+    throw new Error(`Visão nao localizou o elemento: ${friendly}. ${guess.reason}`);
+  }
+
+  let locator: Locator | null = null;
+  if (guess.selector) {
+    locator = input.page.locator(guess.selector).first();
+  } else if (guess.textHint) {
+    locator = input.page.getByText(guess.textHint, { exact: false }).first();
+  }
+
+  if (!locator) {
+    throw new Error(`Visão nao retornou seletor utilizavel para: ${friendly}`);
+  }
+
+  await input.onProgress?.({ stage: "vision_recovery", intent, selector: guess.selector });
+  await locator.waitFor({ state: "visible", timeout: 5_000 });
+  await input.action(locator);
+}
+
+function resolveVisionTarget(input: {
+  pageId?: string;
+  elementId?: string;
+  modalId?: string;
+}): { intent: string; friendly: string } {
+  if (input.modalId) {
+    const modal = getModal(input.modalId);
+    return {
+      intent: modal.primaryAction.intent,
+      friendly: `${modal.id}.primaryAction`,
+    };
+  }
+  if (input.pageId && input.elementId) {
+    const element = getElement(input.pageId, input.elementId);
+    return {
+      intent: element.intent,
+      friendly: `${input.pageId}.${input.elementId}`,
+    };
+  }
+  return { intent: "the target element", friendly: "(unknown)" };
+}
+
+function composeFromCandidates(page: Page, candidates: SelectorCandidate[]): Locator {
+  // Mirror of the map's locator composer; used for ad-hoc per-tipo button ids.
+  let locator: Locator | null = null;
+  for (const c of candidates) {
+    let next: Locator;
+    switch (c.kind) {
+      case "id":
+        next = page.locator(`#${c.id}`);
+        break;
+      case "ngModel":
+        next = page.locator(`[ng-model="${c.value}"]`);
+        break;
+      case "css":
+        next = page.locator(c.selector);
+        break;
+      case "role":
+        next = page.getByRole(c.type, c.name ? { name: c.name } : undefined);
+        break;
+      case "text":
+        next = page.getByText(c.pattern, c.exact !== undefined ? { exact: c.exact } : undefined);
+        break;
+    }
+    locator = locator ? locator.or(next) : next;
+  }
+  if (!locator) throw new Error("composeFromCandidates: empty candidates");
+  return locator.first();
+}
+
+// Backward-compat: `buildGuiaUrl` re-export so other modules can import it.
+export { buildGuiaUrl };
+
+// ─── Granular session API (used by agent-callable workflow tools) ────
+
+export type OrizonOpenSessionInput = {
+  username: string;
+  password: string;
+  jobId: string;
+  visionEnabled?: boolean;
+};
+
+export type OrizonOpenSessionResult = {
+  ok: boolean;
+  browserbaseSessionId?: string;
+  connectUrl?: string;
+  finalUrl?: string;
+  message: string;
+};
+
+/**
+ * Opens a Browserbase session with keepAlive=true, drives the login flow,
+ * and returns the session metadata so subsequent tool calls can reconnect.
+ * The session stays alive until explicitly closed (or until Browserbase's
+ * project-level timeout).
+ */
+export async function openPortalSession(
+  input: OrizonOpenSessionInput,
+): Promise<OrizonOpenSessionResult> {
+  const apiKey = process.env.BROWSERBASE_API_KEY;
+  const projectId = process.env.BROWSERBASE_PROJECT_ID;
+
+  if (!apiKey || !projectId) {
+    return {
+      ok: false,
+      message: "Browserbase nao configurado.",
+    };
+  }
+
+  const [{ default: Browserbase }, { chromium }] = await Promise.all([
+    import("@browserbasehq/sdk"),
+    import("playwright-core"),
+  ]);
+  const browserbase = new Browserbase({ apiKey });
+  const session = await browserbase.sessions.create({
+    projectId,
+    keepAlive: true,
+    userMetadata: {
+      jobId: input.jobId,
+      platform: "orizon_fature",
+      purpose: "granular_session",
+    },
+  });
+
+  const browser = await chromium.connectOverCDP(session.connectUrl);
+  try {
+    const page = await browser.newPage();
+    const visionEnabled = input.visionEnabled === true;
+    await navigateToFatureLogin(page, visionEnabled);
+    await acceptAllCookies(page, visionEnabled);
+    await fillCredentials(page, input.username, input.password);
+
+    if (await page.locator('input[type="password"]').count()) {
+      return {
+        ok: false,
+        browserbaseSessionId: session.id,
+        connectUrl: session.connectUrl,
+        finalUrl: page.url(),
+        message: "Login Orizon nao avancou.",
+      };
+    }
+
+    await acceptAllCookies(page, visionEnabled);
+    await dismissComunicadoInicial(page);
+
+    return {
+      ok: true,
+      browserbaseSessionId: session.id,
+      connectUrl: session.connectUrl,
+      finalUrl: page.url(),
+      message: "Sessao Orizon Fature aberta.",
+    };
+  } finally {
+    // Important: do NOT close the browser — keepAlive keeps the session for
+    // future runPortalActions calls to reconnect.
+    await browser.close().catch(() => undefined);
+  }
+}
+
+export type PortalAction =
+  | { kind: "click"; pageId: string; elementId: string }
+  | { kind: "fill"; pageId: string; elementId: string; value: string }
+  | { kind: "select"; pageId: string; elementId: string; value: string }
+  | { kind: "navigate"; url: string }
+  | { kind: "snapshot" }
+  | { kind: "wait"; ms: number }
+  | { kind: "dismissModal"; modalId: string };
+
+export type PortalActionResult =
+  | { kind: "click" | "fill" | "select" | "navigate" | "wait" | "dismissModal"; ok: boolean; message?: string }
+  | { kind: "snapshot"; ok: true; snapshot: FieldSnapshot }
+  | { kind: "snapshot"; ok: false; message: string };
+
+export type RunPortalActionsInput = {
+  connectUrl: string;
+  actions: PortalAction[];
+  visionEnabled?: boolean;
+};
+
+export type RunPortalActionsResult = {
+  ok: boolean;
+  finalUrl?: string;
+  results: PortalActionResult[];
+};
+
+/**
+ * Reconnects to a kept-alive Browserbase session and executes a list of
+ * actions. The list-of-actions shape (rather than one-action-per-call) is a
+ * deliberate cost optimization: each reconnect takes seconds, so batching
+ * 5-20 actions per call keeps the agent loop responsive.
+ */
+export async function runPortalActions(
+  input: RunPortalActionsInput,
+): Promise<RunPortalActionsResult> {
+  const { chromium } = await import("playwright-core");
+  const browser = await chromium.connectOverCDP(input.connectUrl);
+
+  try {
+    const pages = browser.contexts()[0]?.pages() ?? [];
+    const page = pages[0] ?? (await browser.newPage());
+    const visionEnabled = input.visionEnabled === true;
+    const results: PortalActionResult[] = [];
+
+    for (const action of input.actions) {
+      try {
+        const r = await executeAction(page, action, visionEnabled);
+        results.push(r);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "erro desconhecido";
+        results.push({ kind: action.kind, ok: false, message });
+      }
+    }
+
+    return { ok: true, finalUrl: page.url(), results };
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+}
+
+async function executeAction(
+  page: Page,
+  action: PortalAction,
+  visionEnabled: boolean,
+): Promise<PortalActionResult> {
+  switch (action.kind) {
+    case "click": {
+      await clickWithVisionFallback({
+        page,
+        pageId: action.pageId,
+        elementId: action.elementId,
+        timeoutMs: 10_000,
+        visionEnabled,
+      });
+      return { kind: "click", ok: true };
+    }
+    case "fill": {
+      const locator = selectElement(page, action.pageId, action.elementId);
+      await locator.waitFor({ state: "visible", timeout: 10_000 });
+      await fillByLocator(locator, action.value);
+      return { kind: "fill", ok: true };
+    }
+    case "select": {
+      const locator = selectElement(page, action.pageId, action.elementId);
+      await locator.waitFor({ state: "visible", timeout: 10_000 });
+      await locator
+        .selectOption({ value: action.value })
+        .catch(async () => locator.selectOption({ label: action.value }));
+      return { kind: "select", ok: true };
+    }
+    case "navigate": {
+      await page.goto(action.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      return { kind: "navigate", ok: true };
+    }
+    case "snapshot": {
+      const snapshot = await snapshotPageFields(page);
+      return { kind: "snapshot", ok: true, snapshot };
+    }
+    case "wait": {
+      await page.waitForTimeout(Math.min(Math.max(action.ms, 0), 30_000));
+      return { kind: "wait", ok: true };
+    }
+    case "dismissModal": {
+      if (action.modalId === "comunicadoInicial") {
+        await dismissComunicadoInicial(page);
+      } else if (action.modalId === "tourOverlay") {
+        await dismissTourOverlay(page);
+      } else if (action.modalId === "cookieBanner") {
+        await acceptAllCookies(page, visionEnabled);
+      } else if (action.modalId === "supportTerms") {
+        await acceptSupportTerms(page);
+      }
+      return { kind: "dismissModal", ok: true };
+    }
+  }
+}
+
+/**
+ * Closes a Browserbase session previously opened with `openPortalSession`.
+ * Safe to call multiple times — Browserbase will return 204 even if already closed.
+ */
+export async function closePortalSession(input: { sessionId: string }): Promise<{ ok: boolean }> {
+  const apiKey = process.env.BROWSERBASE_API_KEY;
+  const projectId = process.env.BROWSERBASE_PROJECT_ID;
+  if (!apiKey || !projectId) return { ok: false };
+
+  const { default: Browserbase } = await import("@browserbasehq/sdk");
+  const browserbase = new Browserbase({ apiKey });
+  await browserbase.sessions
+    .update(input.sessionId, { projectId, status: "REQUEST_RELEASE" })
+    .catch(() => undefined);
+  return { ok: true };
 }

@@ -79,6 +79,8 @@ export const jobStatusEnum = pgEnum("job_status", [
 
 export const platformIdEnum = pgEnum("platform_id", ["orizon_fature"]);
 
+export const jobFlowTypeEnum = pgEnum("job_flow_type", ["short", "complete"]);
+
 export const platforms = pgTable("platforms", {
   id: platformIdEnum("id").primaryKey(),
   name: text("name").notNull(),
@@ -123,6 +125,7 @@ export const jobs = pgTable(
       .notNull()
       .references(() => user.id, { onDelete: "cascade" }),
     status: jobStatusEnum("status").notNull().default("uploaded"),
+    flowType: jobFlowTypeEnum("flow_type").notNull().default("short"),
     runId: text("run_id"),
     platformId: platformIdEnum("platform_id").references(() => platforms.id),
     platformCredentialId: text("platform_credential_id").references(
@@ -196,6 +199,44 @@ export const jobEvents = pgTable(
   (table) => [index("job_events_job_id_idx").on(table.jobId)],
 );
 
+export const userPreferences = pgTable("user_preferences", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => user.id, { onDelete: "cascade" }),
+  browserVisionEnabled: boolean("browser_vision_enabled").notNull().default(false),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+export const portalSessionStatusEnum = pgEnum("portal_session_status", [
+  "active",
+  "closed",
+  "expired",
+]);
+
+export const portalSessions = pgTable(
+  "portal_sessions",
+  {
+    id: text("id").primaryKey(),
+    jobId: text("job_id")
+      .notNull()
+      .references(() => jobs.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    browserbaseSessionId: text("browserbase_session_id").notNull(),
+    connectUrl: text("connect_url").notNull(),
+    status: portalSessionStatusEnum("status").notNull().default("active"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    expiresAt: timestamp("expires_at"),
+  },
+  (table) => [
+    index("portal_sessions_job_id_idx").on(table.jobId),
+    index("portal_sessions_user_id_idx").on(table.userId),
+  ],
+);
+
 export const auditLogs = pgTable(
   "audit_logs",
   {
@@ -236,7 +277,10 @@ export const schema = {
   tissDocuments,
   jobEvents,
   auditLogs,
+  userPreferences,
+  portalSessions,
 };
 
 export type JobStatus = (typeof jobStatusEnum.enumValues)[number];
+export type JobFlowType = (typeof jobFlowTypeEnum.enumValues)[number];
 export type PlatformId = (typeof platformIdEnum.enumValues)[number];

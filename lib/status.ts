@@ -1,4 +1,4 @@
-import type { JobStatus } from "@/lib/db/schema";
+import type { JobFlowType, JobStatus } from "@/lib/db/schema";
 
 export const jobStatusLabels: Record<JobStatus, string> = {
   uploaded: "Recebido",
@@ -18,3 +18,8 @@ export const jobStatusTone: Record<JobStatus, "default" | "secondary" | "destruc
     login_succeeded: "default",
     failed: "destructive",
   };
+
+export const jobFlowLabels: Record<JobFlowType, string> = {
+  short: "Fluxo curto",
+  complete: "Fluxo completo",
+};

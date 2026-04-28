@@ -15,6 +15,27 @@
       "when": 1777311270974,
       "tag": "0001_sloppy_leech",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1777324761436,
+      "tag": "0002_reflective_eternity",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1777388516267,
+      "tag": "0003_handy_black_crow",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1777396335418,
+      "tag": "0004_outstanding_gwen_stacy",
+      "breakpoints": true
     }
   ]
 }

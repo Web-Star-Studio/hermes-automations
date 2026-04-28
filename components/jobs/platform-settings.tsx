@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
@@ -221,7 +222,8 @@ export function PlatformSettings() {
             </CardContent>
           </Card>
         </TabsContent>
-        <TabsContent value="security" className="pt-4">
+        <TabsContent value="security" className="space-y-6 pt-4">
+          <BrowserVisionToggle />
           <Card>
             <CardHeader>
               <CardTitle>Controles ativos</CardTitle>
@@ -423,5 +425,71 @@ function DeleteCredentialDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+type PreferencesResponse = {
+  ok: true;
+  preferences: { browserVisionEnabled: boolean };
+};
+
+function BrowserVisionToggle() {
+  const { data, mutate } = useSWR<PreferencesResponse>("/api/settings/preferences");
+  const [isPending, startTransition] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const enabled = data?.preferences.browserVisionEnabled ?? false;
+
+  function toggle(next: boolean) {
+    setError(null);
+    startTransition(async () => {
+      const response = await fetch("/api/settings/preferences", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ browserVisionEnabled: next }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload?.ok) {
+        setError(payload?.error?.message ?? "Não foi possível atualizar a preferência.");
+        return;
+      }
+      await mutate();
+    });
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Recuperação por visão (LLM)</CardTitle>
+        <CardDescription>
+          Quando o agente não encontra um elemento no portal pelo HTML, ele captura uma screenshot
+          da viewport e pede a um modelo multimodal para localizar o alvo. Custa uma chamada de
+          modelo por falha de localização e envia a imagem do portal ao provedor.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex items-center justify-between rounded-md border p-3">
+          <div className="space-y-1">
+            <Label htmlFor="browser-vision-toggle" className="text-sm font-medium">
+              Ativar recuperação por visão
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              Aplica-se aos seus jobs. Desativado por padrão para manter custo previsível e evitar
+              envio de imagens do portal ao modelo.
+            </p>
+          </div>
+          <Switch
+            id="browser-vision-toggle"
+            checked={enabled}
+            disabled={isPending || !data}
+            onCheckedChange={toggle}
+          />
+        </div>
+        {error ? (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        ) : null}
+      </CardContent>
+    </Card>
   );
 }

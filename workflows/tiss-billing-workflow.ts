@@ -6,17 +6,31 @@ import { DurableAgent } from "@workflow/ai/agent";
 import { defineHook, getWritable } from "workflow";
 import { z } from "zod";
 import { buildOrizonBillingAgentInstructions } from "@/lib/agents/orizon-billing-agent-config";
-import { loginToOrizonFature } from "@/lib/browser-adapters/orizon-fature";
+import {
+  closePortalSession,
+  loginToOrizonFature,
+  openPortalSession,
+  runPortalActions,
+  type OrizonGuideToFill,
+  type PortalAction,
+} from "@/lib/browser-adapters/orizon-fature";
+import {
+  mapTissGuideToPortalSteps,
+  tissGuideNameToTipo,
+} from "@/lib/orizon/digitar-guia-fields";
+import type { TissExpanded, TissGuideSummary } from "@/lib/tiss/parser";
 import { db } from "@/lib/db";
 import {
   jobFiles,
   jobs,
   platformCredentials,
+  portalSessions,
   tissDocuments,
 } from "@/lib/db/schema";
 import { getGatewayModelId, getGatewayProviderOptions } from "@/lib/ai/gateway";
 import { appendJobEvent } from "@/lib/jobs/events";
 import { decryptSecret } from "@/lib/security/credentials";
+import { getUserPreferences } from "@/lib/db/user-preferences";
 import { readUploadBytes } from "@/lib/storage/read-upload";
 import { extractXmlDocuments, parseTissXml, type TissSummary } from "@/lib/tiss/parser";
 
@@ -121,6 +135,41 @@ function createOrizonBillingAgent(jobId: string) {
         }),
         execute: async (input) => finalizeJobTool(jobId, input.status, input.summary),
       },
+      openPortalSession: {
+        description:
+          "Abre uma sessao Browserbase com keepAlive=true e faz login no Orizon Fature. Retorna sessionId para uso em runPortalActions. Use quando precisar de controle granular do portal em vez do fillOrizonCredentials monolitico.",
+        inputSchema: z.object({
+          platformCredentialId: z.string().min(1),
+        }),
+        execute: async (input) => openPortalSessionTool(jobId, input.platformCredentialId),
+      },
+      runPortalActions: {
+        description:
+          "Reconecta a uma sessao Orizon previamente aberta e executa uma lista de acoes (click / fill / select / navigate / snapshot / wait / dismissModal). Cada acao referencia pageId+elementId do mapa do portal. Reutilize a sessao em multiplas chamadas, mas batche varias acoes por chamada.",
+        inputSchema: z.object({
+          sessionId: z.string().min(1),
+          actions: z.array(
+            z.discriminatedUnion("kind", [
+              z.object({ kind: z.literal("click"), pageId: z.string(), elementId: z.string() }),
+              z.object({ kind: z.literal("fill"), pageId: z.string(), elementId: z.string(), value: z.string() }),
+              z.object({ kind: z.literal("select"), pageId: z.string(), elementId: z.string(), value: z.string() }),
+              z.object({ kind: z.literal("navigate"), url: z.string() }),
+              z.object({ kind: z.literal("snapshot") }),
+              z.object({ kind: z.literal("wait"), ms: z.number().int().min(0).max(30_000) }),
+              z.object({ kind: z.literal("dismissModal"), modalId: z.string() }),
+            ]),
+          ),
+        }),
+        execute: async (input) => runPortalActionsTool(jobId, input.sessionId, input.actions),
+      },
+      closePortalSession: {
+        description:
+          "Encerra a sessao Browserbase aberta com openPortalSession. Sempre chame ao terminar para liberar recursos.",
+        inputSchema: z.object({
+          sessionId: z.string().min(1),
+        }),
+        execute: async (input) => closePortalSessionTool(jobId, input.sessionId),
+      },
       webSearch: createSafeExaSearchTool(),
       ...createWorkflowSafeBrowserbaseTools(jobId),
     },
@@ -206,77 +255,192 @@ function createWorkflowSafeBrowserbaseTools(jobId: string) {
 async function ingestTissTool(jobId: string): Promise<TissSummary> {
   "use step";
 
-  const [file] = await db.select().from(jobFiles).where(eq(jobFiles.jobId, jobId)).limit(1);
+  const files = await db.select().from(jobFiles).where(eq(jobFiles.jobId, jobId));
 
-  if (!file) {
-    throw new Error("Arquivo do job nao encontrado.");
+  if (files.length === 0) {
+    throw new Error("Nenhum arquivo associado ao job.");
   }
 
-  await emit(jobId, "agent_tool_called", "Agente iniciou extracao TISS.", {
+  await emit(jobId, "agent_tool_called", `Agente iniciou extracao TISS de ${files.length} arquivo(s).`, {
     agentStep: "ingest_tiss",
     toolName: "ingestTiss",
     nodeId: "tiss_extraction",
     status: "running",
     redacted: true,
+    fileCount: files.length,
   });
 
-  const bytes = await readUploadBytes(file.blobUrl);
-  const [document] = extractXmlDocuments(file.fileName, bytes);
-  const summary = parseTissXml(document.xml);
+  const perFile: Array<{ fileName: string; summary: TissSummary }> = [];
+  for (const file of files) {
+    const bytes = await readUploadBytes(file.blobUrl);
+    const documents = extractXmlDocuments(file.fileName, bytes);
+    // Each ZIP can contain multiple XMLs; merge them as if they were one TISS payload.
+    for (const doc of documents) {
+      const summary = parseTissXml(doc.xml);
+      perFile.push({ fileName: file.fileName, summary });
+    }
+  }
+
+  const aggregate = aggregateTissSummaries(perFile);
 
   await db
     .insert(tissDocuments)
     .values({
       id: randomUUID(),
       jobId,
-      standardVersion: summary.standardVersion,
-      transactionType: summary.transactionType,
-      providerName: summary.providerName,
-      providerRegister: summary.providerRegister,
-      operatorRegister: summary.operatorRegister,
-      batchNumber: summary.batchNumber,
-      guideCount: summary.guideCount,
-      totalAmount: summary.totalAmount,
-      beneficiaryNames: summary.beneficiaryNames,
-      rawSummary: summary.rawSummary,
+      standardVersion: aggregate.standardVersion,
+      transactionType: aggregate.transactionType,
+      providerName: aggregate.providerName,
+      providerRegister: aggregate.providerRegister,
+      operatorRegister: aggregate.operatorRegister,
+      batchNumber: aggregate.batchNumber,
+      guideCount: aggregate.guideCount,
+      totalAmount: aggregate.totalAmount,
+      beneficiaryNames: aggregate.beneficiaryNames,
+      rawSummary: aggregate.rawSummary,
     })
     .onConflictDoUpdate({
       target: tissDocuments.jobId,
       set: {
-        standardVersion: summary.standardVersion,
-        transactionType: summary.transactionType,
-        providerName: summary.providerName,
-        providerRegister: summary.providerRegister,
-        operatorRegister: summary.operatorRegister,
-        batchNumber: summary.batchNumber,
-        guideCount: summary.guideCount,
-        totalAmount: summary.totalAmount,
-        beneficiaryNames: summary.beneficiaryNames,
-        rawSummary: summary.rawSummary,
+        standardVersion: aggregate.standardVersion,
+        transactionType: aggregate.transactionType,
+        providerName: aggregate.providerName,
+        providerRegister: aggregate.providerRegister,
+        operatorRegister: aggregate.operatorRegister,
+        batchNumber: aggregate.batchNumber,
+        guideCount: aggregate.guideCount,
+        totalAmount: aggregate.totalAmount,
+        beneficiaryNames: aggregate.beneficiaryNames,
+        rawSummary: aggregate.rawSummary,
         updatedAt: new Date(),
       },
     });
 
-  await emit(jobId, "agent_tool_completed", "Extracao TISS concluida.", {
-    agentStep: "ingest_tiss",
-    toolName: "ingestTiss",
-    nodeId: "tiss_extraction",
-    status: "success",
-    redacted: true,
-    fileName: file.fileName,
-    standardVersion: summary.standardVersion,
-    guideCount: summary.guideCount,
-  });
+  await emit(
+    jobId,
+    "agent_tool_completed",
+    `Extracao TISS concluida (${files.length} arquivo(s), ${aggregate.guideCount} guia(s)).`,
+    {
+      agentStep: "ingest_tiss",
+      toolName: "ingestTiss",
+      nodeId: "tiss_extraction",
+      status: "success",
+      redacted: true,
+      fileCount: files.length,
+      standardVersion: aggregate.standardVersion,
+      guideCount: aggregate.guideCount,
+    },
+  );
 
   return {
-    ...summary,
+    ...aggregate,
     rawSummary: {
-      standardVersion: summary.standardVersion,
-      transactionType: summary.transactionType,
-      providerName: summary.providerName,
-      batchNumber: summary.batchNumber,
-      guideCount: summary.guideCount,
-      totalAmount: summary.totalAmount,
+      standardVersion: aggregate.standardVersion,
+      transactionType: aggregate.transactionType,
+      providerName: aggregate.providerName,
+      batchNumber: aggregate.batchNumber,
+      guideCount: aggregate.guideCount,
+      totalAmount: aggregate.totalAmount,
+      fileCount: files.length,
+    },
+  };
+}
+
+/**
+ * Combines parsed summaries from N files into a single TissSummary suitable
+ * for the aggregate `tissDocuments` row. Sums totals, concatenates guides
+ * and beneficiaries (deduped), and records per-file breakdown in
+ * rawSummary.expanded.files for the UI.
+ */
+function aggregateTissSummaries(
+  perFile: Array<{ fileName: string; summary: TissSummary }>,
+): TissSummary {
+  if (perFile.length === 0) {
+    throw new Error("aggregateTissSummaries: nada para agregar.");
+  }
+  if (perFile.length === 1) {
+    const only = perFile[0];
+    const expanded = only.summary.rawSummary.expanded;
+    return {
+      ...only.summary,
+      rawSummary: {
+        ...only.summary.rawSummary,
+        expanded: expanded
+          ? {
+              ...expanded,
+              files: [
+                {
+                  fileName: only.fileName,
+                  guideCount: only.summary.guideCount,
+                  totalAmount: only.summary.totalAmount,
+                  batchNumber: only.summary.batchNumber,
+                },
+              ],
+            }
+          : expanded,
+      },
+    };
+  }
+
+  const first = perFile[0].summary;
+  const guides = perFile.flatMap((p) => p.summary.rawSummary.expanded?.guides ?? []);
+  const procedureCount = perFile.reduce(
+    (acc, p) => acc + (p.summary.rawSummary.expanded?.procedureCount ?? 0),
+    0,
+  );
+  const totalAmountSum = perFile.reduce((acc, p) => {
+    const n = Number(p.summary.totalAmount ?? 0);
+    return Number.isFinite(n) ? acc + n : acc;
+  }, 0);
+  const guideCountSum = perFile.reduce((acc, p) => {
+    const n = Number(p.summary.guideCount ?? 0);
+    return Number.isFinite(n) ? acc + n : acc;
+  }, 0);
+  const beneficiaryNames = Array.from(
+    new Set(perFile.flatMap((p) => p.summary.beneficiaryNames)),
+  ).slice(0, 50);
+  const guideTypesAll = Array.from(
+    new Set(perFile.flatMap((p) => p.summary.rawSummary.expanded?.guideTypes ?? [])),
+  );
+
+  return {
+    standardVersion: first.standardVersion,
+    transactionType: first.transactionType,
+    providerName: first.providerName,
+    providerRegister: first.providerRegister,
+    operatorRegister: first.operatorRegister,
+    batchNumber: perFile.map((p) => p.summary.batchNumber).filter(Boolean).join(", ") || null,
+    guideCount: String(guideCountSum),
+    totalAmount: totalAmountSum > 0 ? totalAmountSum.toFixed(2) : null,
+    beneficiaryNames,
+    rawSummary: {
+      ...first.rawSummary,
+      expanded: {
+        competencia: first.rawSummary.expanded?.competencia ?? null,
+        dataEnvioLote: first.rawSummary.expanded?.dataEnvioLote ?? null,
+        dataInicialFaturamento: first.rawSummary.expanded?.dataInicialFaturamento ?? null,
+        dataFinalFaturamento: first.rawSummary.expanded?.dataFinalFaturamento ?? null,
+        tipoFaturamento: first.rawSummary.expanded?.tipoFaturamento ?? null,
+        guideTypes: guideTypesAll,
+        procedureCount,
+        procedureCodes: first.rawSummary.expanded?.procedureCodes ?? [],
+        amounts: first.rawSummary.expanded?.amounts ?? {
+          procedimentos: null,
+          taxasAlugueis: null,
+          materiais: null,
+          medicamentos: null,
+          diarias: null,
+          gases: null,
+          total: totalAmountSum > 0 ? totalAmountSum.toFixed(2) : null,
+        },
+        guides,
+        files: perFile.map((p) => ({
+          fileName: p.fileName,
+          guideCount: p.summary.guideCount,
+          totalAmount: p.summary.totalAmount,
+          batchNumber: p.summary.batchNumber,
+        })),
+      },
     },
   };
 }
@@ -284,10 +448,20 @@ async function ingestTissTool(jobId: string): Promise<TissSummary> {
 async function recordAgentStarted(jobId: string) {
   "use step";
 
-  await emit(jobId, "agent_started", "Agente Hermes iniciado.", {
+  const [job] = await db
+    .select({ flowType: jobs.flowType })
+    .from(jobs)
+    .where(eq(jobs.id, jobId))
+    .limit(1);
+
+  const flowType = job?.flowType ?? "short";
+  const flowLabel = flowType === "complete" ? "Fluxo completo" : "Fluxo curto";
+
+  await emit(jobId, "agent_started", `Agente Hermes iniciado (${flowLabel}).`, {
     agentStep: "start",
     nodeId: "agent_review",
     status: "running",
+    flowType,
     redacted: true,
   });
 }
@@ -367,17 +541,27 @@ async function fillOrizonCredentialsTool(
     throw new Error("Credencial da plataforma nao encontrada.");
   }
 
-  const [file] = await db.select().from(jobFiles).where(eq(jobFiles.jobId, jobId)).limit(1);
+  const files = await db.select().from(jobFiles).where(eq(jobFiles.jobId, jobId));
 
-  if (!file) {
-    throw new Error("Arquivo do job nao encontrado.");
+  if (files.length === 0) {
+    throw new Error("Nenhum arquivo associado ao job.");
   }
 
-  if (!file.fileName.toLowerCase().endsWith(".zip")) {
-    throw new Error("O portal Orizon Fature so aceita arquivos .zip; reenvie o lote compactado.");
+  for (const f of files) {
+    if (!f.fileName.toLowerCase().endsWith(".zip")) {
+      throw new Error(
+        `O portal Orizon Fature so aceita arquivos .zip; reenvie '${f.fileName}' compactado.`,
+      );
+    }
   }
 
-  const fileBytes = await readUploadBytes(file.blobUrl);
+  const tissFiles = await Promise.all(
+    files.map(async (f) => ({
+      fileName: f.fileName,
+      bytes: Buffer.from(await readUploadBytes(f.blobUrl)),
+      contentType: f.contentType,
+    })),
+  );
 
   await db
     .update(jobs)
@@ -418,17 +602,21 @@ async function fillOrizonCredentialsTool(
     authTag: credential.authTag,
   });
 
+  const userPrefs = await getUserPreferences(job.userId);
+
+  const guidesToFill =
+    job.flowType === "complete" ? await buildGuidesToFill(jobId) : undefined;
+
   let result;
   try {
     result = await loginToOrizonFature({
       username: credential.username,
       password,
       jobId,
-      tissFile: {
-        fileName: file.fileName,
-        bytes: Buffer.from(fileBytes),
-        contentType: file.contentType,
-      },
+      flowType: job.flowType,
+      visionEnabled: userPrefs.browserVisionEnabled,
+      tissFiles,
+      guidesToFill,
       onProgress: async (event) => {
         await emitSubmitProgress(jobId, event);
       },
@@ -585,21 +773,46 @@ const submitProgressMessages: Record<string, string> = {
   batches_selected: "Lotes selecionados para envio.",
   submitted: "Botao Enviar acionado.",
   confirmed: "Envio confirmado no modal.",
+  submission_succeeded: "Lotes enviados com sucesso (modal de sucesso confirmado).",
+  digitar_guia_opened: "Pagina 'Digitar Guia' aberta no portal.",
+  guide_started: "Iniciando preenchimento de guia no portal.",
+  guide_step_filled: "Etapa da guia preenchida.",
+  guide_saved: "Guia salva no portal.",
+  guide_failed: "Falha ao salvar guia no portal.",
+  vision_recovery: "Visão (LLM) usada para localizar elemento na pagina.",
 };
 
 async function emitSubmitProgress(
   jobId: string,
-  event: { stage: keyof typeof submitProgressMessages },
+  event: import("@/lib/browser-adapters/orizon-fature").OrizonProgressEvent,
 ) {
   const message = submitProgressMessages[event.stage] ?? "Etapa de envio TISS.";
-  await emit(jobId, "submit_tiss_progress", message, {
+  const payload: Record<string, unknown> = {
     agentStep: "submit_tiss",
     toolName: "fillOrizonCredentials",
     nodeId: "submit_tiss",
-    status: "running",
+    status: event.stage === "guide_failed" ? "failed" : "running",
     stage: event.stage,
     redacted: true,
-  });
+  };
+  if (event.stage === "vision_recovery") {
+    payload.intent = event.intent;
+    if (event.selector) payload.selector = event.selector;
+  }
+  if ("guideIndex" in event) {
+    payload.guideIndex = event.guideIndex;
+  }
+  if (event.stage === "guide_started") {
+    payload.tipoId = event.tipoId;
+    if (event.label) payload.label = event.label;
+  }
+  if (event.stage === "guide_step_filled") {
+    payload.step = event.step;
+  }
+  if (event.stage === "guide_failed") {
+    payload.reason = event.reason;
+  }
+  await emit(jobId, "submit_tiss_progress", message, payload);
 }
 
 async function recordBrowserbaseSessionPrepared(jobId: string) {
@@ -771,11 +984,196 @@ function resolveBrowserRuntime() {
   return "browserbase";
 }
 
+async function buildGuidesToFill(jobId: string): Promise<OrizonGuideToFill[]> {
+  "use step";
+
+  const [tiss] = await db
+    .select({ operatorRegister: tissDocuments.operatorRegister, rawSummary: tissDocuments.rawSummary })
+    .from(tissDocuments)
+    .where(eq(tissDocuments.jobId, jobId))
+    .limit(1);
+
+  if (!tiss) return [];
+
+  const expanded = (tiss.rawSummary as { expanded?: TissExpanded } | null)?.expanded;
+  const guides = expanded?.guides ?? [];
+  const lotOperadoraAns = tiss.operatorRegister ?? "";
+
+  return guides.map((guide: TissGuideSummary, index: number): OrizonGuideToFill => {
+    const tipoId = tissGuideNameToTipo(guide.type);
+    return {
+      index,
+      tipoId,
+      // Prefer per-guide registroANS when present (handles mixed-operadora batches);
+      // fall back to the lote-level value.
+      operadoraAns: guide.registroANS ?? lotOperadoraAns,
+      steps: mapTissGuideToPortalSteps(guide, tipoId),
+      procedures: guide.procedures.map((p) => ({
+        codigo: p.codigo,
+        descricao: p.descricao,
+        quantidade: p.quantidade,
+        valorUnitario: p.valorUnitario,
+        valorTotal: p.valorTotal,
+        dataExecucao: p.dataExecucao,
+        codigoTabela: p.codigoTabela,
+      })),
+      tissData: {
+        type: guide.type,
+        numeroGuiaPrestador: guide.numeroGuiaPrestador,
+        numeroGuiaOperadora: guide.numeroGuiaOperadora,
+        numeroGuiaPrincipal: guide.numeroGuiaPrincipal,
+        registroANS: guide.registroANS ?? lotOperadoraAns,
+        beneficiario: guide.beneficiario,
+        numeroCarteira: guide.numeroCarteira,
+        dataAtendimento: guide.dataAtendimento,
+        dataAutorizacao: guide.dataAutorizacao,
+        senhaAutorizacao: guide.senhaAutorizacao,
+        validadeSenha: guide.validadeSenha,
+        valorTotal: guide.valorTotal,
+      },
+      label: guide.numeroGuiaPrestador ?? guide.beneficiario ?? `guia-${index + 1}`,
+    };
+  });
+}
+
 function maskUsername(username: string) {
   const [name, domain] = username.split("@");
   const visible = name.slice(0, 2);
   const maskedName = `${visible}${"*".repeat(Math.max(name.length - visible.length, 3))}`;
   return domain ? `${maskedName}@${domain}` : maskedName;
+}
+
+async function openPortalSessionTool(jobId: string, platformCredentialId: string) {
+  "use step";
+
+  const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
+  if (!job) throw new Error("Job nao encontrado.");
+
+  const [credential] = await db
+    .select()
+    .from(platformCredentials)
+    .where(
+      and(
+        eq(platformCredentials.id, platformCredentialId),
+        eq(platformCredentials.userId, job.userId),
+      ),
+    )
+    .limit(1);
+  if (!credential) throw new Error("Credencial nao encontrada.");
+
+  const password = decryptSecret({
+    encryptedValue: credential.encryptedPassword,
+    iv: credential.iv,
+    authTag: credential.authTag,
+  });
+
+  const userPrefs = await getUserPreferences(job.userId);
+
+  const result = await openPortalSession({
+    username: credential.username,
+    password,
+    jobId,
+    visionEnabled: userPrefs.browserVisionEnabled,
+  });
+
+  if (!result.ok || !result.browserbaseSessionId || !result.connectUrl) {
+    return { ok: false, message: result.message };
+  }
+
+  const sessionRowId = randomUUID();
+  await db.insert(portalSessions).values({
+    id: sessionRowId,
+    jobId,
+    userId: job.userId,
+    browserbaseSessionId: result.browserbaseSessionId,
+    connectUrl: result.connectUrl,
+    status: "active",
+  });
+
+  await emit(jobId, "portal_session_opened", "Sessao Orizon Fature aberta.", {
+    nodeId: "browserbase_session",
+    status: "running",
+    sessionId: sessionRowId,
+    redacted: true,
+  });
+
+  return {
+    ok: true,
+    sessionId: sessionRowId,
+    finalUrl: result.finalUrl,
+    message: result.message,
+    usernameMasked: maskUsername(credential.username),
+  };
+}
+
+async function runPortalActionsTool(
+  jobId: string,
+  sessionId: string,
+  actions: PortalAction[],
+) {
+  "use step";
+
+  const [row] = await db
+    .select()
+    .from(portalSessions)
+    .where(and(eq(portalSessions.id, sessionId), eq(portalSessions.jobId, jobId)))
+    .limit(1);
+  if (!row) throw new Error("Sessao do portal nao encontrada.");
+  if (row.status !== "active") throw new Error(`Sessao do portal nao esta ativa: ${row.status}.`);
+
+  const userPrefs = await getUserPreferences(row.userId);
+
+  const result = await runPortalActions({
+    connectUrl: row.connectUrl,
+    actions,
+    visionEnabled: userPrefs.browserVisionEnabled,
+  });
+
+  await db
+    .update(portalSessions)
+    .set({ updatedAt: new Date() })
+    .where(eq(portalSessions.id, sessionId));
+
+  await emit(jobId, "portal_actions_executed", `Executadas ${actions.length} acao(oes) no portal.`, {
+    nodeId: "submit_tiss",
+    status: "running",
+    sessionId,
+    actionCount: actions.length,
+    okCount: result.results.filter((r) => r.ok).length,
+    redacted: true,
+  });
+
+  return {
+    ok: result.ok,
+    finalUrl: result.finalUrl,
+    results: result.results,
+  };
+}
+
+async function closePortalSessionTool(jobId: string, sessionId: string) {
+  "use step";
+
+  const [row] = await db
+    .select()
+    .from(portalSessions)
+    .where(and(eq(portalSessions.id, sessionId), eq(portalSessions.jobId, jobId)))
+    .limit(1);
+  if (!row) return { ok: false, message: "Sessao nao encontrada." };
+
+  await closePortalSession({ sessionId: row.browserbaseSessionId });
+  await db
+    .update(portalSessions)
+    .set({ status: "closed", updatedAt: new Date() })
+    .where(eq(portalSessions.id, sessionId));
+
+  await emit(jobId, "portal_session_closed", "Sessao Orizon Fature encerrada.", {
+    nodeId: "browserbase_session",
+    status: "success",
+    sessionId,
+    redacted: true,
+  });
+
+  return { ok: true };
 }
 
 async function emit(

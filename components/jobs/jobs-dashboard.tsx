@@ -40,6 +40,7 @@ type Job = {
   status: keyof typeof jobStatusLabels;
   createdAt: string;
   file?: { fileName: string } | null;
+  fileCount?: number;
   tiss?: { providerName?: string | null; batchNumber?: string | null; totalAmount?: string | null } | null;
 };
 
@@ -173,9 +174,17 @@ export function JobsDashboard() {
                 {filtered.map((job) => (
                   <TableRow key={job.id}>
                     <TableCell>
-                      <Link className="font-medium underline-offset-4 hover:underline" href={`/app/jobs/${job.id}`}>
+                      <Link
+                        className="font-medium underline-offset-4 hover:underline"
+                        href={`/app/jobs/${job.id}`}
+                      >
                         {job.file?.fileName ?? job.id}
                       </Link>
+                      {(job.fileCount ?? 0) > 1 ? (
+                        <span className="ml-2 text-xs text-muted-foreground">
+                          + {(job.fileCount ?? 1) - 1} arquivo(s)
+                        </span>
+                      ) : null}
                     </TableCell>
                     <TableCell>
                       <Badge variant={jobStatusTone[job.status]}>{jobStatusLabels[job.status]}</Badge>

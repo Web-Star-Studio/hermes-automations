@@ -2,16 +2,34 @@ import path from "node:path";
 import { XMLParser } from "fast-xml-parser";
 import { unzipSync } from "fflate";
 
+export type TissProcedureFull = {
+  codigo: string;
+  descricao: string | null;
+  quantidade: string | null;
+  valorUnitario: string | null;
+  valorTotal: string | null;
+  dataExecucao: string | null;
+  /** Tabela TUSS / outros (geralmente "22"). */
+  codigoTabela: string | null;
+};
+
 export type TissGuideSummary = {
   type: string;
   numeroGuiaPrestador: string | null;
   numeroGuiaOperadora: string | null;
+  numeroGuiaPrincipal: string | null;
+  registroANS: string | null;
+  senhaAutorizacao: string | null;
+  dataAutorizacao: string | null;
+  validadeSenha: string | null;
   beneficiario: string | null;
   numeroCarteira: string | null;
   dataAtendimento: string | null;
   valorTotal: string | null;
   procedureCount: number;
   procedureCodes: string[];
+  /** Per-procedure full detail. Empty when the parser couldn't extract procedures. */
+  procedures: TissProcedureFull[];
 };
 
 export type TissProcedureCode = {
@@ -41,6 +59,13 @@ export type TissExpanded = {
   procedureCodes: TissProcedureCode[];
   amounts: TissAmountBreakdown;
   guides: TissGuideSummary[];
+  /** Per-file breakdown when the job has multiple jobFiles. Empty for single-file jobs. */
+  files?: Array<{
+    fileName: string;
+    guideCount: string;
+    totalAmount: string | null;
+    batchNumber: string | null;
+  }>;
 };
 
 export type TissSummary = {
@@ -272,8 +297,12 @@ function summarizeGuide(entry: { type: string; node: Record<string, unknown> }):
     numeroGuiaOperadora: findFirst(guideValues, [
       "numeroGuiaOperadora",
       "numeroGuiaAtribuidoOperadora",
-      "numeroGuiaPrincipal",
     ]),
+    numeroGuiaPrincipal: findFirst(guideValues, ["numeroGuiaPrincipal"]),
+    registroANS: findFirst(guideValues, ["registroANS", "ansRegistro"]),
+    senhaAutorizacao: findFirst(guideValues, ["senha", "senhaField"]),
+    dataAutorizacao: findFirst(guideValues, ["dataAutorizacao"]),
+    validadeSenha: findFirst(guideValues, ["dataValidadeSenha", "validadeSenha"]),
     beneficiario:
       findFirst(guideValues, [
         "nomeBeneficiario",
@@ -301,11 +330,12 @@ function summarizeGuide(entry: { type: string; node: Record<string, unknown> }):
       ]) ?? null,
     procedureCount: procedures.length,
     procedureCodes: uniq(procedures.map((p) => p.codigo)).slice(0, 6),
+    procedures: procedures.slice(0, 30),
   };
 }
 
-function collectProcedures(input: unknown): Array<{ codigo: string; descricao: string | null }> {
-  const out: Array<{ codigo: string; descricao: string | null }> = [];
+function collectProcedures(input: unknown): TissProcedureFull[] {
+  const out: TissProcedureFull[] = [];
   walk(input);
   return out;
 
@@ -323,8 +353,32 @@ function collectProcedures(input: unknown): Array<{ codigo: string; descricao: s
           if (item && typeof item === "object") {
             const procValues = collectValues(item);
             const codigo = findFirst(procValues, ["codigoProcedimento", "codigo"]);
-            const descricao = findFirst(procValues, ["descricaoProcedimento", "descricao"]);
-            if (codigo) out.push({ codigo, descricao });
+            if (!codigo) continue;
+            out.push({
+              codigo,
+              descricao: findFirst(procValues, ["descricaoProcedimento", "descricao"]),
+              quantidade: findFirst(procValues, [
+                "quantidadeExecutada",
+                "quantidadeAutorizada",
+                "quantidadeSolicitada",
+                "qtdExecutada",
+                "quantidade",
+              ]),
+              valorUnitario: findFirst(procValues, [
+                "valorUnitario",
+                "valor",
+              ]),
+              valorTotal: findFirst(procValues, [
+                "valorTotalProcedimento",
+                "valorTotal",
+              ]),
+              dataExecucao: findFirst(procValues, [
+                "dataExecucao",
+                "dataExecucaoProcedimento",
+                "dataAtendimento",
+              ]),
+              codigoTabela: findFirst(procValues, ["codigoTabela", "tabela"]),
+            });
           }
         }
       }

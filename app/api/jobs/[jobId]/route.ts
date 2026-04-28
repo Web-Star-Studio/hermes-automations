@@ -36,8 +36,8 @@ export async function GET(request: Request, { params }: RouteContext) {
     );
   }
 
-  const [[file], [tiss], events] = await Promise.all([
-    db.select().from(jobFiles).where(eq(jobFiles.jobId, jobId)).limit(1),
+  const [files, [tiss], events] = await Promise.all([
+    db.select().from(jobFiles).where(eq(jobFiles.jobId, jobId)).orderBy(asc(jobFiles.createdAt)),
     db.select().from(tissDocuments).where(eq(tissDocuments.jobId, jobId)).limit(1),
     db
       .select()
@@ -48,7 +48,9 @@ export async function GET(request: Request, { params }: RouteContext) {
 
   const workflow = buildJobWorkflowState(job, events);
 
-  return NextResponse.json({ ok: true, job, file, tiss, events, workflow });
+  // Backward-compat: keep `file` as the first attached file so existing
+  // clients still resolve a name; new clients should read `files[]`.
+  return NextResponse.json({ ok: true, job, file: files[0] ?? null, files, tiss, events, workflow });
 }
 
 export async function DELETE(request: Request, { params }: RouteContext) {
