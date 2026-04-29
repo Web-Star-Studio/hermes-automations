@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Briefcase, ScrollText, Settings } from "lucide-react";
+import { Briefcase, ScrollText, Settings, Users } from "lucide-react";
 import {
   SidebarMenu,
   SidebarMenuButton,
@@ -26,6 +26,12 @@ const PRIMARY_ITEMS: NavItem[] = [
 ];
 
 const ADMIN_ITEMS: NavItem[] = [
+  {
+    href: "/app/admin/users",
+    label: "Usuários",
+    icon: Users,
+    match: (pathname) => pathname.startsWith("/app/admin/users"),
+  },
   {
     href: "/app/admin/logs",
     label: "Logs",

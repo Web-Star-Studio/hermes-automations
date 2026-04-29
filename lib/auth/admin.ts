@@ -3,7 +3,6 @@ import { notFound, redirect } from "next/navigation";
 import { NextResponse } from "next/server";
 import type { Session } from "@/lib/auth";
 import { auth } from "@/lib/auth";
-import { getSessionFromHeaders } from "@/lib/session";
 
 function adminEmails(): string[] {
   const raw = process.env.ADMIN_EMAILS ?? "";
@@ -28,7 +27,7 @@ export async function requireAdminPageSession(): Promise<Session> {
 }
 
 export async function requireAdminApiSession(headersList: Headers) {
-  const session = await getSessionFromHeaders(headersList);
+  const session = await auth.api.getSession({ headers: headersList });
   if (!session) {
     return {
       session: null,
