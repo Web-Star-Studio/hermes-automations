@@ -3,12 +3,13 @@
 import useSWR from "swr";
 import dynamic from "next/dynamic";
 import { useMemo, useState, useTransition } from "react";
-import { CheckCircle2, Loader2, Wrench } from "lucide-react";
+import { CheckCircle2, ChevronDown, Loader2, Wrench } from "lucide-react";
 import { jobFlowLabels, jobStatusLabels, jobStatusTone } from "@/lib/status";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -478,54 +479,58 @@ function BeneficiariesAndGuides({
 }
 
 function AgentTimeline({ events }: { events: AgentEvent[] }) {
-  if (events.length === 0) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle>Eventos do agente</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="text-sm text-muted-foreground">Sem eventos por enquanto.</p>
-        </CardContent>
-      </Card>
-    );
-  }
-
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Eventos do agente</CardTitle>
-        <CardDescription>Linha do tempo do que foi feito durante o job.</CardDescription>
-      </CardHeader>
-      <CardContent>
-        <ol className="space-y-3 border-l border-muted pl-5">
-          {events.map((event) => {
-            const tool = typeof event.payload?.toolName === "string" ? event.payload.toolName : null;
-            const status = typeof event.payload?.status === "string" ? event.payload.status : null;
-            return (
-              <li key={event.id} className="relative">
-                <span
-                  className={
-                    "absolute -left-[27px] top-[7px] size-2.5 rounded-full border-2 border-background " +
-                    dotColor(status)
-                  }
-                />
-                <div className="flex flex-wrap items-baseline gap-2">
-                  <span className="font-mono text-xs text-muted-foreground">{formatTime(event.createdAt)}</span>
-                  {tool ? (
-                    <span className="inline-flex items-center gap-1 rounded-sm bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                      <Wrench className="size-3" />
-                      {tool}
-                    </span>
-                  ) : null}
-                </div>
-                <p className="mt-0.5 text-sm whitespace-pre-wrap">{event.message}</p>
-              </li>
-            );
-          })}
-        </ol>
-      </CardContent>
-    </Card>
+    <Collapsible defaultOpen={false}>
+      <Card>
+        <CollapsibleTrigger asChild>
+          <CardHeader className="group flex cursor-pointer flex-row items-start justify-between gap-2 select-none">
+            <div className="space-y-1">
+              <CardTitle>Eventos do agente</CardTitle>
+              <CardDescription>
+                {events.length === 0
+                  ? "Sem eventos por enquanto."
+                  : `Linha do tempo (${events.length} ${events.length === 1 ? "evento" : "eventos"}).`}
+              </CardDescription>
+            </div>
+            <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-data-[state=open]:rotate-180" />
+          </CardHeader>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <CardContent>
+            {events.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Sem eventos por enquanto.</p>
+            ) : (
+              <ol className="space-y-3 border-l border-muted pl-5">
+                {events.map((event) => {
+                  const tool = typeof event.payload?.toolName === "string" ? event.payload.toolName : null;
+                  const status = typeof event.payload?.status === "string" ? event.payload.status : null;
+                  return (
+                    <li key={event.id} className="relative">
+                      <span
+                        className={
+                          "absolute -left-[27px] top-[7px] size-2.5 rounded-full border-2 border-background " +
+                          dotColor(status)
+                        }
+                      />
+                      <div className="flex flex-wrap items-baseline gap-2">
+                        <span className="font-mono text-xs text-muted-foreground">{formatTime(event.createdAt)}</span>
+                        {tool ? (
+                          <span className="inline-flex items-center gap-1 rounded-sm bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                            <Wrench className="size-3" />
+                            {tool}
+                          </span>
+                        ) : null}
+                      </div>
+                      <p className="mt-0.5 text-sm whitespace-pre-wrap">{event.message}</p>
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+          </CardContent>
+        </CollapsibleContent>
+      </Card>
+    </Collapsible>
   );
 }
 

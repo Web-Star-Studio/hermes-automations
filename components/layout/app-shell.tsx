@@ -1,6 +1,7 @@
 import Image from "next/image";
 import Link from "next/link";
 import type { Session } from "@/lib/auth";
+import { isAdminSession } from "@/lib/auth/admin";
 import { SignOutButton } from "@/components/auth/sign-out-button";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Separator } from "@/components/ui/separator";
@@ -34,6 +35,7 @@ export function AppShell({
   children: React.ReactNode;
 }) {
   const displayName = session.user.name ?? session.user.email ?? "Usuario";
+  const isAdmin = isAdminSession(session);
 
   return (
     <SidebarProvider>
@@ -59,7 +61,7 @@ export function AppShell({
 
         <SidebarContent>
           <SidebarGroup>
-            <SidebarPrimaryNav />
+            <SidebarPrimaryNav isAdmin={isAdmin} />
           </SidebarGroup>
         </SidebarContent>
 

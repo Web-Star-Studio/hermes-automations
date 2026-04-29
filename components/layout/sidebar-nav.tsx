@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Briefcase, Settings } from "lucide-react";
+import { Briefcase, ScrollText, Settings } from "lucide-react";
 import {
   SidebarMenu,
   SidebarMenuButton,
@@ -22,6 +22,15 @@ const PRIMARY_ITEMS: NavItem[] = [
     label: "Jobs",
     icon: Briefcase,
     match: (pathname) => pathname === "/app/jobs" || pathname.startsWith("/app/jobs/"),
+  },
+];
+
+const ADMIN_ITEMS: NavItem[] = [
+  {
+    href: "/app/admin/logs",
+    label: "Logs",
+    icon: ScrollText,
+    match: (pathname) => pathname.startsWith("/app/admin/logs"),
   },
 ];
 
@@ -57,8 +66,9 @@ function NavList({ items }: { items: NavItem[] }) {
   );
 }
 
-export function SidebarPrimaryNav() {
-  return <NavList items={PRIMARY_ITEMS} />;
+export function SidebarPrimaryNav({ isAdmin = false }: { isAdmin?: boolean }) {
+  const items = isAdmin ? [...PRIMARY_ITEMS, ...ADMIN_ITEMS] : PRIMARY_ITEMS;
+  return <NavList items={items} />;
 }
 
 export function SidebarFooterNav() {
