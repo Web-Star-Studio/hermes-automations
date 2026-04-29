@@ -491,6 +491,17 @@ async function uploadTissBatch(page: Page, files: OrizonTissFile[]) {
   if (files.length === 0) {
     throw new Error("Nenhum arquivo para enviar.");
   }
+
+  // Defense in depth: if any file came back from storage as zero-byte
+  // (e.g., R2 read returned an empty body, blob URL was bad), fail early
+  // with a clear error instead of letting Playwright upload garbage.
+  const empty = files.find((f) => !f.bytes || f.bytes.byteLength === 0);
+  if (empty) {
+    throw new Error(
+      `Arquivo '${empty.fileName}' chegou vazio da camada de storage. Verifique a integridade do upload (R2/local-fs).`,
+    );
+  }
+
   const fileInput = selectElement(page, "uploadTiss", "fileInput");
   await fileInput.waitFor({ state: "attached", timeout: 30_000 });
 
@@ -503,16 +514,53 @@ async function uploadTissBatch(page: Page, files: OrizonTissFile[]) {
     })),
   );
 
-  // Wait for every file to register in the list. Orizon validates each
-  // upload server-side before showing the row, so this also confirms the
-  // batch is ready for selection / submit.
-  await Promise.all(
-    files.map((file) =>
-      page
-        .getByText(file.fileName, { exact: false })
-        .first()
-        .waitFor({ state: "visible", timeout: 60_000 }),
-    ),
+  // Validate the list actually rendered. Naive `getByText(filename)` matches
+  // hidden placeholders too, so we instead poll the DOM until we see the
+  // expected number of upload-list checkboxes (the column-header select-all
+  // + one per file row). If the count doesn't reach files.length + 1 within
+  // the timeout, dump the page state into the error so we know exactly what
+  // the portal showed (or didn't).
+  const expectedRowCheckboxes = files.length;
+  const deadline = Date.now() + 90_000;
+  let lastSeen = -1;
+  while (Date.now() < deadline) {
+    const rows = await page.evaluate(() => {
+      const checkboxes = Array.from(
+        document.querySelectorAll('input[type="checkbox"]:not([disabled])'),
+      ).filter((el) => {
+        const r = (el as HTMLElement).getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        const cs = window.getComputedStyle(el);
+        return cs.display !== "none" && cs.visibility !== "hidden";
+      });
+      // Subtract one for the column-header select-all if present.
+      const selectAll = document.querySelector("input.ckbExcluirTodosArquivo");
+      return Math.max(checkboxes.length - (selectAll ? 1 : 0), 0);
+    });
+    if (rows >= expectedRowCheckboxes) return;
+    lastSeen = rows;
+    await page.waitForTimeout(800);
+  }
+
+  const diagnostic = await page.evaluate((expectedNames: string[]) => {
+    const namesSeen = expectedNames.filter((n) =>
+      Array.from(document.body.querySelectorAll("*")).some((el) =>
+        (el.textContent ?? "").includes(n),
+      ),
+    );
+    const errorTexts = Array.from(
+      document.querySelectorAll(".alert-danger, .error, .text-danger, [role='alert']"),
+    )
+      .map((el) => (el.textContent ?? "").replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .slice(0, 3);
+    return { url: window.location.href, namesSeen, errorTexts };
+  }, files.map((f) => f.fileName));
+  throw new Error(
+    `Lista de uploads nao renderizou ${expectedRowCheckboxes} arquivo(s). ` +
+      `Visiveis: ${lastSeen}. URL: ${diagnostic.url}. ` +
+      `Nomes encontrados no DOM: [${diagnostic.namesSeen.join(", ")}]. ` +
+      `Erros visiveis: [${diagnostic.errorTexts.join(" | ") || "nenhum"}].`,
   );
 }
 
@@ -581,29 +629,100 @@ async function awaitSubmissionSuccess(
   visionEnabled: boolean,
   onProgress?: OrizonLoginInput["onProgress"],
 ) {
-  // After "Enviar arquivos válidos" the portal pops a success modal
-  // with title "Lotes enviados com sucesso!" and two buttons:
-  // 'Enviar mais lotes' (white) and 'Ir para Lista de Lotes' (blue).
-  // We wait for the title to confirm the submission was accepted, then
-  // click 'Enviar mais lotes' to dismiss and end the flow cleanly.
-  const successTitle = page.getByText(/lotes enviados com sucesso/i).first();
-  await successTitle.waitFor({ state: "visible", timeout: 60_000 });
+  // After "Enviar arquivos válidos" the portal pops a success modal with
+  // title "Lotes enviados com sucesso!" + two buttons:
+  // 'Enviar mais lotes' and 'Ir para Lista de Lotes'.
+  //
+  // Important: the title <h1> is templated into the DOM at all times via
+  // Angular ng-show, so naive text matching always finds a hidden element.
+  // Scope to an OPEN Bootstrap modal (.modal.in / .modal.show, or
+  // [role="dialog"] not hidden) and key on the action button — buttons
+  // only render once the modal actually opens.
+  const successButton = page
+    .locator('.modal.in, .modal.show, [role="dialog"]:not([aria-hidden="true"])')
+    .filter({ hasText: /lotes enviados com sucesso/i })
+    .getByRole("button", { name: /^enviar mais lotes$/i })
+    .first();
 
-  const { action } = selectModal(page, "lotesEnviadosSucesso");
   try {
-    await action.waitFor({ state: "visible", timeout: 10_000 });
-    await action.click({ timeout: 5_000 });
-    await page.waitForTimeout(600);
+    await successButton.waitFor({ state: "visible", timeout: 60_000 });
   } catch (error) {
-    if (!visionEnabled) throw error;
-    await visionRecoverByMap({
-      page,
-      modalId: "lotesEnviadosSucesso",
-      onProgress,
-      action: async (locator) => {
-        await locator.click({ timeout: 5_000 });
-      },
+    if (visionEnabled) {
+      // Last resort: ask vision whether the success state actually rendered
+      // somewhere we missed (different modal class, different layout, etc.).
+      try {
+        await visionRecoverByMap({
+          page,
+          modalId: "lotesEnviadosSucesso",
+          onProgress,
+          action: async (locator) => {
+            await locator.click({ timeout: 5_000 });
+          },
+        });
+        return;
+      } catch {
+        // Fall through to the structured error.
+      }
+    }
+    const diagnostics = await captureSubmissionDiagnostics(page);
+    throw new Error(
+      `Modal de sucesso "Lotes enviados com sucesso!" nao apareceu em 60s. ${diagnostics}`,
+      { cause: error },
+    );
+  }
+
+  await successButton.click({ timeout: 5_000 });
+  await page.waitForTimeout(600);
+}
+
+/**
+ * Inspects the page state after a submission timeout and returns a
+ * structured one-line diagnostic. Helps tell apart "the click missed",
+ * "the portal silently rejected", and "the success modal auto-dismissed
+ * before we caught it".
+ */
+async function captureSubmissionDiagnostics(page: Page): Promise<string> {
+  try {
+    const state = await page.evaluate(() => {
+      const visible = (el: Element) => {
+        const r = (el as HTMLElement).getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        const cs = window.getComputedStyle(el);
+        return cs.display !== "none" && cs.visibility !== "hidden";
+      };
+      const trim = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, 200);
+
+      const confirmModalOpen = Array.from(document.querySelectorAll(".modal.in")).some((m) =>
+        /confirmar dados dos lotes/i.test(m.textContent ?? ""),
+      );
+      const errorTexts = Array.from(
+        document.querySelectorAll(".alert-danger, .error, .text-danger, [role='alert']"),
+      )
+        .filter(visible)
+        .map((el) => trim(el.textContent ?? ""))
+        .filter(Boolean)
+        .slice(0, 3);
+      const fileRowCount = document.querySelectorAll(".ckbExcluirTodosArquivo").length
+        ? Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(visible).length - 1
+        : 0;
+
+      return {
+        url: window.location.href,
+        bodyHasModalOpen: document.body.classList.contains("modal-open"),
+        confirmModalOpen,
+        errorTexts,
+        fileRowCount: Math.max(fileRowCount, 0),
+      };
     });
+
+    const parts: string[] = [`url=${state.url}`];
+    if (state.bodyHasModalOpen) parts.push("modal-open");
+    if (state.confirmModalOpen) parts.push("confirm-modal-still-open (click missed?)");
+    if (state.fileRowCount > 0) parts.push(`fileRows=${state.fileRowCount}`);
+    if (state.errorTexts.length) parts.push(`errors=[${state.errorTexts.join(" | ")}]`);
+    return parts.join("; ");
+  } catch {
+    return "diagnostico nao disponivel";
   }
 }
 
