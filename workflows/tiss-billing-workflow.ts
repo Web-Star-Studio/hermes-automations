@@ -780,13 +780,15 @@ const submitProgressMessages: Record<string, string> = {
   guide_saved: "Guia salva no portal.",
   guide_failed: "Falha ao salvar guia no portal.",
   vision_recovery: "Visão (LLM) usada para localizar elemento na pagina.",
+  log: "Log do adaptador Orizon.",
 };
 
 async function emitSubmitProgress(
   jobId: string,
   event: import("@/lib/browser-adapters/orizon-fature").OrizonProgressEvent,
 ) {
-  const message = submitProgressMessages[event.stage] ?? "Etapa de envio TISS.";
+  const message =
+    event.stage === "log" ? event.message : submitProgressMessages[event.stage] ?? "Etapa de envio TISS.";
   const payload: Record<string, unknown> = {
     agentStep: "submit_tiss",
     toolName: "fillOrizonCredentials",

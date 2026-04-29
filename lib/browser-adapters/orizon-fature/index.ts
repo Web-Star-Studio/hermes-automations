@@ -81,7 +81,8 @@ export type OrizonProgressEvent =
   | { stage: "guide_step_filled"; guideIndex: number; step: number }
   | { stage: "guide_saved"; guideIndex: number }
   | { stage: "guide_failed"; guideIndex: number; reason: string }
-  | { stage: "vision_recovery"; intent: string; selector?: string };
+  | { stage: "vision_recovery"; intent: string; selector?: string }
+  | { stage: "log"; message: string };
 
 export type OrizonLoginResult = {
   ok: boolean;
@@ -212,7 +213,12 @@ async function runFluxoCurto(
   await submitBatches(page, visionEnabled, input.onProgress);
   await input.onProgress?.({ stage: "submitted" });
 
-  await confirmSubmission(page, visionEnabled, input.onProgress);
+  await confirmSubmission(
+    page,
+    visionEnabled,
+    (input.tissFiles ?? []).length,
+    input.onProgress,
+  );
   await input.onProgress?.({ stage: "confirmed" });
 
   await awaitSubmissionSuccess(page, visionEnabled, input.onProgress);
@@ -611,8 +617,15 @@ async function submitBatches(
 async function confirmSubmission(
   page: Page,
   visionEnabled: boolean,
+  expectedFileCount: number,
   onProgress?: OrizonLoginInput["onProgress"],
 ) {
+  // The "Confirmar dados dos lotes" modal opens immediately after Enviar but
+  // each row starts in "Validando..." state. Clicking "Enviar arquivos
+  // válidos" while validation is still running submits with empty/partial
+  // results — we need to wait for every row to settle into either
+  // "Arquivo válido para envio." or an error label.
+  await waitForBatchValidation(page, expectedFileCount, onProgress);
   await clickWithVisionFallback({
     page,
     pageId: "confirmBatchesModal",
@@ -622,6 +635,64 @@ async function confirmSubmission(
     onProgress,
   });
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
+}
+
+async function waitForBatchValidation(
+  page: Page,
+  expectedFileCount: number,
+  onProgress?: OrizonLoginInput["onProgress"],
+) {
+  const modalLocator = page
+    .locator('.modal.in, .modal.show, [role="dialog"]:not([aria-hidden="true"])')
+    .filter({ hasText: /confirmar dados dos lotes/i })
+    .first();
+  await modalLocator.waitFor({ state: "visible", timeout: 30_000 });
+
+  const deadline = Date.now() + 180_000;
+  let lastValidating = -1;
+  let lastValidos = -1;
+  while (Date.now() < deadline) {
+    const state = await modalLocator
+      .evaluate((root) => {
+        const text = (root as HTMLElement).innerText ?? "";
+        const validating = (text.match(/Validando\.\.\./gi) ?? []).length;
+        const validos = (text.match(/Arquivo v[aá]lido para envio\./gi) ?? []).length;
+        const invalidos = (text.match(/Arquivo inv[aá]lido/gi) ?? []).length;
+        return { validating, validos, invalidos };
+      })
+      .catch(() => null);
+
+    if (!state) {
+      await page.waitForTimeout(800);
+      continue;
+    }
+
+    if (
+      state.validating === 0 &&
+      state.validos + state.invalidos >= Math.max(1, expectedFileCount)
+    ) {
+      await onProgress?.({
+        stage: "log",
+        message: `Validação Orizon concluída: ${state.validos} válido(s), ${state.invalidos} inválido(s).`,
+      });
+      return;
+    }
+
+    if (state.validating !== lastValidating || state.validos !== lastValidos) {
+      lastValidating = state.validating;
+      lastValidos = state.validos;
+      await onProgress?.({
+        stage: "log",
+        message: `Aguardando validação Orizon: ${state.validating} validando, ${state.validos} válido(s).`,
+      });
+    }
+
+    await page.waitForTimeout(800);
+  }
+
+  throw new Error(
+    `Validação dos lotes não concluiu em 180s (modal "Confirmar dados dos lotes" ainda mostra "Validando...").`,
+  );
 }
 
 async function awaitSubmissionSuccess(
