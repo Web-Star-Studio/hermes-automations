@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.170",
+    "@aws-sdk/client-s3": "^3.1038.0",
     "@better-auth/drizzle-adapter": "^1.6.9",
     "@browserbasehq/ai-sdk": "^0.1.0",
     "@browserbasehq/sdk": "^2.10.0",
@@ -26,7 +27,6 @@
     "@streamdown/code": "^1.1.1",
     "@streamdown/math": "^1.0.2",
     "@streamdown/mermaid": "^1.0.2",
-    "@vercel/blob": "^2.3.3",
     "@workflow/ai": "^4.1.2",
     "@xyflow/react": "^12.10.2",
     "ai": "^6.0.168",

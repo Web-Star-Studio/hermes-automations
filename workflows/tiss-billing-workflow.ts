@@ -1182,20 +1182,30 @@ async function emit(
   message: string,
   payload: Record<string, unknown> = {},
 ) {
+  // The DB row is the source of truth — it must always be written.
   const event = await appendJobEvent({ jobId, type, message, payload });
-  const writer = getWritable<BillingWorkflowEvent>().getWriter();
 
+  // The writable stream is shared with the agent (`agent.stream({ writable: getWritable() })`)
+  // and gets closed when the agent finishes (sendFinish: true by default). Any emit calls
+  // that fire AFTER the agent's last step (e.g., from finalizeAgentRun) will hit a closed
+  // stream and return HTTP 409. The live-update miss is non-fatal — the timeline reads
+  // from the DB.
   try {
-    await writer.write({
-      type,
-      message,
-      jobId,
-      payload: {
-        ...payload,
-        eventId: event.id,
-      },
-    });
-  } finally {
-    writer.releaseLock();
+    const writer = getWritable<BillingWorkflowEvent>().getWriter();
+    try {
+      await writer.write({
+        type,
+        message,
+        jobId,
+        payload: {
+          ...payload,
+          eventId: event.id,
+        },
+      });
+    } finally {
+      writer.releaseLock();
+    }
+  } catch {
+    // Stream closed (post-agent-finish) — DB row already written above.
   }
 }

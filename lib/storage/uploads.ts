@@ -1,7 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { put } from "@vercel/blob";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
+import {
+  buildR2Url,
+  getR2BucketName,
+  getR2Client,
+  isR2Configured,
+} from "@/lib/storage/r2-client";
 
 export type SavedUpload = {
   fileName: string;
@@ -28,31 +34,45 @@ export async function saveUpload(file: File, userId: string): Promise<SavedUploa
 
   const checksum = createHash("sha256").update(bytes).digest("hex");
   const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const pathname = `uploads/${userId}/${randomUUID()}-${safeName}`;
+  // Object key inside the bucket. Used both as R2 key and as a local-fs path
+  // when R2 is not configured (development fallback only).
+  const key = `uploads/${userId}/${randomUUID()}-${safeName}`;
+  const contentType = file.type || inferContentType(extension);
 
-  if (process.env.BLOB_READ_WRITE_TOKEN) {
-    const blob = await put(pathname, bytes, {
-      access: "private",
-      contentType: file.type || inferContentType(extension),
-    });
+  if (isR2Configured()) {
+    const bucket = getR2BucketName()!;
+    await getR2Client().send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: bytes,
+        ContentType: contentType,
+        // Defense in depth: the bucket itself should be private (no public
+        // access). We never expose the object URL — reads go through the
+        // server which uses the SDK to fetch.
+        Metadata: { checksum, userId },
+      }),
+    );
 
     return {
       fileName: file.name,
-      contentType: blob.contentType ?? inferContentType(extension),
+      contentType,
       size: bytes.byteLength,
       checksum,
-      blobUrl: blob.url,
-      pathname,
+      blobUrl: buildR2Url(bucket, key),
+      pathname: key,
     };
   }
 
-  const localPath = path.join(process.cwd(), ".local-uploads", pathname);
+  // Local-fs fallback for `pnpm dev` without R2 credentials. The path is
+  // ephemeral on Vercel and is intentionally NOT used in production.
+  const localPath = path.join(process.cwd(), ".local-uploads", key);
   await mkdir(path.dirname(localPath), { recursive: true });
   await writeFile(localPath, bytes);
 
   return {
     fileName: file.name,
-    contentType: file.type || inferContentType(extension),
+    contentType,
     size: bytes.byteLength,
     checksum,
     blobUrl: `local://${localPath}`,
