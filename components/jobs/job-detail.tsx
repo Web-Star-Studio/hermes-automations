@@ -17,6 +17,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { BrowserbaseSessionsCard } from "@/components/jobs/browserbase-sessions-card";
 import type { JobWorkflowEdge, JobWorkflowNode } from "@/lib/jobs/workflow-visualization";
 import type { TissExpanded, TissGuideSummary, TissProcedureCode } from "@/lib/tiss/parser";
 
@@ -236,6 +237,7 @@ export function JobDetail({ jobId }: { jobId: string }) {
           </div>
 
           <AgentTimeline events={timelineEvents} />
+          <BrowserbaseSessionsCard jobId={jobId} />
         </TabsContent>
 
         <TabsContent value="workflow" className="space-y-6 pt-4">
