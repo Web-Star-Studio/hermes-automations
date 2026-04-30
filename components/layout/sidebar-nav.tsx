@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Briefcase, ScrollText, Settings, Users } from "lucide-react";
+import { Briefcase, KeyRound, ScrollText, Settings, Users } from "lucide-react";
 import {
   SidebarMenu,
   SidebarMenuButton,
@@ -45,7 +45,14 @@ const FOOTER_ITEMS: NavItem[] = [
     href: "/app/settings/platforms",
     label: "Configuracoes",
     icon: Settings,
-    match: (pathname) => pathname.startsWith("/app/settings"),
+    match: (pathname) =>
+      pathname.startsWith("/app/settings") && !pathname.startsWith("/app/settings/api-keys"),
+  },
+  {
+    href: "/app/settings/api-keys",
+    label: "API Keys",
+    icon: KeyRound,
+    match: (pathname) => pathname.startsWith("/app/settings/api-keys"),
   },
 ];
 

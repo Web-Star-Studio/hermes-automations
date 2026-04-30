@@ -8,6 +8,9 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: process.cwd(),
   },
+  outputFileTracingIncludes: {
+    "/api/openapi": ["./docs/openapi.yaml"],
+  },
 };
 
 export default withWorkflow(nextConfig);

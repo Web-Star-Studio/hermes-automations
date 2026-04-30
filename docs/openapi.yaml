@@ -1,0 +1,699 @@
+openapi: 3.1.0
+info:
+  title: Hermes Automation API
+  version: 1.0.0
+  summary: REST API for triggering and monitoring TISS billing automations.
+  description: |
+    External-system entry point to the Hermes automation pipeline. A caller can:
+
+    - upload one or more TISS files (`.zip` / `.xml`) to create a job;
+    - optionally pre-supply a `platformCredentialId` to skip the human approval step;
+    - poll job status or stream live events via SSE;
+    - manage platform credentials programmatically.
+
+    All endpoints are scoped per API key owner. Resources are isolated per user; an
+    API key cannot read or modify resources owned by another user.
+  contact:
+    name: Webstar
+    email: dev@webstar.studio
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: https://hermes.example.com
+    description: Production (replace with your deployment)
+
+tags:
+  - name: Jobs
+    description: TISS billing jobs — create, list, inspect, cancel, stream events.
+  - name: Platform credentials
+    description: Encrypted credentials used by the agent to log into supported portals.
+
+security:
+  - apiKey: []
+
+paths:
+  /api/v1/jobs:
+    post:
+      tags: [Jobs]
+      operationId: createJob
+      summary: Create a job and enqueue the automation
+      description: |
+        Accepts one or more files via `multipart/form-data` and starts the durable
+        workflow. If `platformCredentialId` is provided, the human-validation step is
+        auto-approved (signaled by the `validation_approved` event with
+        `autoApproved: true` in its payload).
+
+        Files are saved to the configured object store (R2 in production, local fs in
+        development). Per-file limits — `.zip` or `.xml` only, ≤ 25 MB each, 1–50
+        files per request.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items:
+                    type: string
+                    format: binary
+                  description: One or more TISS `.zip` or `.xml` files.
+                flowType:
+                  $ref: "#/components/schemas/JobFlowType"
+                platformId:
+                  $ref: "#/components/schemas/PlatformId"
+                platformCredentialId:
+                  type: string
+                  description: |
+                    Optional. When set, the workflow auto-approves the validation
+                    step and proceeds directly to login + submission. Must be a
+                    credential owned by the API key's user.
+            encoding:
+              file:
+                contentType: application/zip, application/xml
+      responses:
+        "200":
+          description: Job created and workflow enqueued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, jobId, runId, fileCount, autoApproved]
+                properties:
+                  ok: { const: true }
+                  jobId: { type: string, format: uuid }
+                  runId:
+                    type: string
+                    description: Workflow run id (used internally by the SSE stream).
+                  fileCount: { type: integer, minimum: 1 }
+                  autoApproved:
+                    type: boolean
+                    description: True when `platformCredentialId` was provided.
+        "400":
+          description: Validation error (missing file, too many files, unknown credential, etc.).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    get:
+      tags: [Jobs]
+      operationId: listJobs
+      summary: List jobs owned by the API key holder
+      description: Returns up to 50 most recent jobs for the authenticated user.
+      responses:
+        "200":
+          description: Job list (newest first).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, jobs]
+                properties:
+                  ok: { const: true }
+                  jobs:
+                    type: array
+                    items: { $ref: "#/components/schemas/JobListEntry" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/jobs/{jobId}:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [Jobs]
+      operationId: getJob
+      summary: Job detail with files, TISS summary, and event timeline
+      responses:
+        "200":
+          description: Job snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/jobs/{jobId}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    post:
+      tags: [Jobs]
+      operationId: cancelJob
+      summary: Cancel an in-flight job
+      description: |
+        Cancels the underlying durable workflow if the job is still in a live status
+        (`uploaded`, `awaiting_validation`, `approved`, `running`). The job row is
+        preserved (status set to `failed`, `errorMessage` set to "Cancelado via API")
+        so the timeline remains auditable. Idempotent: calling on a terminal job
+        returns `200` with `alreadyTerminal: true`.
+      responses:
+        "200":
+          description: Cancellation accepted (or job was already terminal).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok]
+                    properties:
+                      ok: { const: true }
+                  - type: object
+                    required: [ok, alreadyTerminal, status]
+                    properties:
+                      ok: { const: true }
+                      alreadyTerminal: { const: true }
+                      status: { $ref: "#/components/schemas/JobStatus" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/jobs/{jobId}/events:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+      - in: query
+        name: startIndex
+        required: false
+        schema: { type: integer, minimum: 0 }
+        description: Replay events starting at this index (0 = from the beginning).
+    get:
+      tags: [Jobs]
+      operationId: streamJobEvents
+      summary: Live event stream (SSE)
+      description: |
+        Server-Sent Events feed bound to the underlying workflow run.
+
+        The connection stays open until the workflow finishes. Each chunk is a single
+        SSE record:
+
+        ```
+        data: {"type":"agent_tool_completed","message":"...","payload":{...}}\n\n
+        ```
+
+        Returns `409 RUN_NOT_READY` if the workflow hasn't started yet — retry after
+        a short delay. The same events are also persisted in the database and can be
+        polled via `GET /api/v1/jobs/{jobId}` (`events[]`).
+      responses:
+        "200":
+          description: SSE stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Concatenated SSE records. Each record is of the form
+                  `data: <json>\n\n` where `<json>` matches the JobEvent payload.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Workflow not started yet.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/v1/platform-credentials:
+    get:
+      tags: [Platform credentials]
+      operationId: listPlatformCredentials
+      summary: List credentials owned by the API key holder
+      responses:
+        "200":
+          description: Credential list (newest first).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, credentials]
+                properties:
+                  ok: { const: true }
+                  credentials:
+                    type: array
+                    items: { $ref: "#/components/schemas/PlatformCredential" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Platform credentials]
+      operationId: createPlatformCredential
+      summary: Create a credential
+      description: |
+        The password is encrypted server-side using AES-256-GCM and is never returned
+        in any response. The plain `username` is also masked when read back
+        (`usernameMasked` is the only field exposed by API).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CredentialCreate" }
+      responses:
+        "200":
+          description: Credential created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, credential]
+                properties:
+                  ok: { const: true }
+                  credential: { $ref: "#/components/schemas/PlatformCredential" }
+        "400":
+          description: Invalid body (missing fields, value out of range).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: A credential with this label already exists for the platform.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/v1/platform-credentials/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Platform credentials]
+      operationId: getPlatformCredential
+      summary: Read one credential
+      responses:
+        "200":
+          description: Credential snapshot.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, credential]
+                properties:
+                  ok: { const: true }
+                  credential: { $ref: "#/components/schemas/PlatformCredential" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Platform credentials]
+      operationId: updatePlatformCredential
+      summary: Update label / username / password
+      description: |
+        Any subset of `label`, `username`, `password` can be sent. Sending `password`
+        re-encrypts with the current `CREDENTIAL_ENCRYPTION_KEY`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CredentialPatch" }
+      responses:
+        "200":
+          description: Credential updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, credential]
+                properties:
+                  ok: { const: true }
+                  credential: { $ref: "#/components/schemas/PlatformCredential" }
+        "400":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+          description: Invalid body.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Duplicate label.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+    delete:
+      tags: [Platform credentials]
+      operationId: deletePlatformCredential
+      summary: Delete a credential
+      description: |
+        Fails with `409 CREDENTIAL_IN_USE` when an existing job still references the
+        credential — update or create a new one instead.
+      responses:
+        "200":
+          description: Credential deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { const: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Credential in use by an existing job.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: hapi_*
+      description: |
+        API key issued under **Settings → API Keys** (`/app/settings/api-keys`).
+
+        Format: `hapi_` + 32-character base32 body (≈ 37 chars total). The plaintext
+        secret is shown **only once** at creation; the server stores `sha256(secret)`
+        and discards the raw value.
+
+        Send the key as `Authorization: Bearer hapi_xxxxxxxxxx…`.
+
+  parameters:
+    JobId:
+      in: path
+      name: jobId
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: Missing, malformed, revoked, or expired API key.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    Forbidden:
+      description: API key owner is not in `approved` status.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    NotFound:
+      description: Resource not found, or not owned by the caller.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  schemas:
+    JobStatus:
+      type: string
+      enum: [uploaded, awaiting_validation, approved, running, login_succeeded, failed]
+      description: |
+        Job lifecycle. Terminal states: `login_succeeded`, `failed`.
+
+        Transitions:
+        - `uploaded` → `awaiting_validation` (after TISS extraction)
+        - `awaiting_validation` → `approved` (human approval **or** auto-approve)
+        - `approved` → `running` (login + submit started)
+        - `running` → `login_succeeded` | `failed`
+
+    JobFlowType:
+      type: string
+      enum: [short, complete]
+      default: short
+      description: |
+        - `short`: upload the `.zip` to the portal and confirm submission.
+        - `complete`: open *Digitar Guia* and key in each guide field-by-field.
+
+    PlatformId:
+      type: string
+      enum: [orizon_fature]
+      default: orizon_fature
+
+    Job:
+      type: object
+      required:
+        [
+          id, userId, status, flowType, runId, platformId, platformCredentialId,
+          validationHookToken, errorMessage, createdAt, updatedAt,
+        ]
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string }
+        status: { $ref: "#/components/schemas/JobStatus" }
+        flowType: { $ref: "#/components/schemas/JobFlowType" }
+        runId:
+          type: [string, "null"]
+          description: Workflow run id (set right after enqueue).
+        platformId:
+          oneOf:
+            - { $ref: "#/components/schemas/PlatformId" }
+            - type: "null"
+        platformCredentialId:
+          type: [string, "null"]
+        validationHookToken:
+          type: [string, "null"]
+          description: Internal — used by the resume-validation flow.
+        errorMessage:
+          type: [string, "null"]
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    JobListEntry:
+      allOf:
+        - $ref: "#/components/schemas/Job"
+        - type: object
+          required: [file, fileCount, tiss]
+          properties:
+            file:
+              oneOf:
+                - type: object
+                  properties:
+                    fileName: { type: string }
+                  required: [fileName]
+                - type: "null"
+            fileCount: { type: integer, minimum: 0 }
+            tiss:
+              oneOf:
+                - { $ref: "#/components/schemas/TissDocument" }
+                - type: "null"
+
+    JobDetail:
+      type: object
+      required: [ok, job, file, files, tiss, events, workflow]
+      properties:
+        ok: { const: true }
+        job: { $ref: "#/components/schemas/Job" }
+        file:
+          oneOf:
+            - { $ref: "#/components/schemas/JobFile" }
+            - type: "null"
+          description: First attached file (back-compat).
+        files:
+          type: array
+          items: { $ref: "#/components/schemas/JobFile" }
+        tiss:
+          oneOf:
+            - { $ref: "#/components/schemas/TissDocument" }
+            - type: "null"
+        events:
+          type: array
+          items: { $ref: "#/components/schemas/JobEvent" }
+        workflow: { $ref: "#/components/schemas/JobWorkflow" }
+
+    JobFile:
+      type: object
+      required:
+        [id, jobId, fileName, contentType, size, checksum, blobUrl, pathname, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        jobId: { type: string, format: uuid }
+        fileName: { type: string }
+        contentType: { type: string, examples: ["application/zip"] }
+        size:
+          type: string
+          description: Bytes (stored as text to avoid integer-overflow on large files).
+        checksum:
+          type: string
+          description: SHA-256 hex digest of the uploaded bytes.
+        blobUrl:
+          type: string
+          description: Internal storage URI (`r2://…` or `local://…`).
+        pathname: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    TissDocument:
+      type: object
+      required:
+        [
+          id, jobId, standardVersion, transactionType, providerName,
+          providerRegister, operatorRegister, batchNumber, guideCount,
+          totalAmount, beneficiaryNames, rawSummary, validatedData,
+          createdAt, updatedAt,
+        ]
+      properties:
+        id: { type: string, format: uuid }
+        jobId: { type: string, format: uuid }
+        standardVersion:
+          type: [string, "null"]
+          examples: ["4.02.00"]
+        transactionType:
+          type: [string, "null"]
+          examples: ["ENVIO_LOTE_GUIAS"]
+        providerName: { type: [string, "null"] }
+        providerRegister: { type: [string, "null"] }
+        operatorRegister:
+          type: [string, "null"]
+          description: ANS operator registration (typically 6 digits).
+        batchNumber: { type: [string, "null"] }
+        guideCount:
+          type: [string, "null"]
+          description: Number of guides in the batch (stored as text).
+        totalAmount:
+          type: [string, "null"]
+          description: Total invoice amount in BRL, two decimals.
+        beneficiaryNames:
+          type: array
+          items: { type: string }
+          description: Up to 50 beneficiary names extracted from the XML (PII — handle accordingly).
+        rawSummary:
+          type: object
+          description: Structured TISS summary (versioned shape — see `expanded` field).
+          additionalProperties: true
+        validatedData:
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: "null"
+          description: Free-form payload supplied at validation time.
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    JobEvent:
+      type: object
+      required: [id, jobId, type, message, payload, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        jobId: { type: string, format: uuid }
+        type:
+          type: string
+          description: |
+            Event taxonomy. Common values:
+            `uploaded`, `agent_started`, `agent_tool_called`,
+            `agent_tool_completed`, `agent_step_started`,
+            `human_validation_requested`, `validation_approved`,
+            `browser_session_started`, `browser_action_completed`,
+            `submit_tiss_progress`, `submit_tiss_completed`,
+            `submit_tiss_failed`, `agent_completed`, `failed`.
+        message: { type: string }
+        payload:
+          type: object
+          additionalProperties: true
+          description: |
+            Event-type-specific. Common keys: `agentStep`, `toolName`, `toolCallId`,
+            `nodeId`, `status` (`pending|running|awaiting_human|success|failed`),
+            `redacted`, `autoApproved`, `sessionId`, `debugUrl`, `finalUrl`, `stage`.
+        createdAt: { type: string, format: date-time }
+
+    JobWorkflow:
+      type: object
+      required: [nodes, edges, currentNode]
+      properties:
+        nodes:
+          type: array
+          items: { $ref: "#/components/schemas/JobWorkflowNode" }
+        edges:
+          type: array
+          items: { $ref: "#/components/schemas/JobWorkflowEdge" }
+        currentNode:
+          type: [string, "null"]
+          description: Id of the node the agent is currently on.
+
+    JobWorkflowNode:
+      type: object
+      required: [id, title, description, status, position]
+      properties:
+        id:
+          type: string
+          enum:
+            - upload
+            - tiss_extraction
+            - agent_review
+            - human_validation
+            - browserbase_session
+            - orizon_login
+            - submit_tiss
+            - complete
+            - error
+        title: { type: string }
+        description: { type: string }
+        status:
+          type: string
+          enum: [pending, running, awaiting_human, success, failed]
+        position:
+          type: object
+          required: [x, y]
+          properties:
+            x: { type: number }
+            y: { type: number }
+
+    JobWorkflowEdge:
+      type: object
+      required: [id, source, target]
+      properties:
+        id: { type: string }
+        source: { type: string }
+        target: { type: string }
+
+    PlatformCredential:
+      type: object
+      required: [id, platformId, label, usernameMasked]
+      properties:
+        id: { type: string, format: uuid }
+        platformId: { $ref: "#/components/schemas/PlatformId" }
+        label: { type: string, minLength: 2, maxLength: 80 }
+        usernameMasked:
+          type: string
+          description: Username with the middle masked (e.g. `us***om`). The plaintext is never returned.
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CredentialCreate:
+      type: object
+      required: [platformId, label, username, password]
+      properties:
+        platformId: { $ref: "#/components/schemas/PlatformId" }
+        label: { type: string, minLength: 2, maxLength: 80 }
+        username: { type: string, minLength: 1, maxLength: 160 }
+        password:
+          type: string
+          minLength: 1
+          maxLength: 512
+          format: password
+
+    CredentialPatch:
+      type: object
+      minProperties: 1
+      properties:
+        label: { type: string, minLength: 2, maxLength: 80 }
+        username: { type: string, minLength: 1, maxLength: 160 }
+        password:
+          type: string
+          minLength: 1
+          maxLength: 512
+          format: password
+
+    ErrorResponse:
+      type: object
+      required: [ok, error]
+      properties:
+        ok: { const: false }
+        error:
+          type: object
+          required: [message]
+          properties:
+            code:
+              type: string
+              description: |
+                Stable, machine-readable code. Known values include:
+                `UNAUTHORIZED`, `PENDING_APPROVAL`, `NOT_FOUND`, `INVALID_BODY`,
+                `FILE_REQUIRED`, `TOO_MANY_FILES`, `UPLOAD_FAILED`,
+                `CREDENTIAL_NOT_FOUND`, `DUPLICATE_LABEL`, `CREDENTIAL_IN_USE`,
+                `RUN_NOT_READY`, `RUN_NOT_FOUND`.
+            message: { type: string }

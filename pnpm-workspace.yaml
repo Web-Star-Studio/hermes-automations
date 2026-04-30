@@ -1,3 +1,12 @@
 ignoredBuiltDependencies:
   - sharp
   - unrs-resolver
+
+onlyBuiltDependencies:
+  - '@nestjs/core'
+  - '@swc/core'
+  - bufferutil
+  - cbor-extract
+  - esbuild
+  - msw
+  - protobufjs

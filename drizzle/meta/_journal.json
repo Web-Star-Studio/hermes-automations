@@ -43,6 +43,13 @@
       "when": 1777476897559,
       "tag": "0005_flaky_eddie_brock",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1777558344719,
+      "tag": "0006_daffy_wild_pack",
+      "breakpoints": true
     }
   ]
 }

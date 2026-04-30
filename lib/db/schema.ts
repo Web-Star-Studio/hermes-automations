@@ -240,6 +240,27 @@ export const portalSessions = pgTable(
   ],
 );
 
+export const apiKeys = pgTable(
+  "api_keys",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    label: text("label").notNull(),
+    prefix: text("prefix").notNull(),
+    hashedKey: text("hashed_key").notNull().unique(),
+    lastUsedAt: timestamp("last_used_at"),
+    expiresAt: timestamp("expires_at"),
+    revokedAt: timestamp("revoked_at"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (table) => [
+    index("api_keys_user_id_idx").on(table.userId),
+    index("api_keys_hashed_key_idx").on(table.hashedKey),
+  ],
+);
+
 export const auditLogs = pgTable(
   "audit_logs",
   {
@@ -259,6 +280,7 @@ export const usersRelations = relations(user, ({ many }) => ({
   accounts: many(account),
   jobs: many(jobs),
   credentials: many(platformCredentials),
+  apiKeys: many(apiKeys),
 }));
 
 export const jobsRelations = relations(jobs, ({ one, many }) => ({
@@ -282,6 +304,7 @@ export const schema = {
   auditLogs,
   userPreferences,
   portalSessions,
+  apiKeys,
 };
 
 export type JobStatus = (typeof jobStatusEnum.enumValues)[number];

@@ -471,6 +471,11 @@ async function requestHumanValidationTool(
   summary: string,
   toolCallId: string,
 ) {
+  // M2M flow: caller pre-supplied platformId + platformCredentialId at job
+  // creation. Skip the human pause and proceed straight to login.
+  const preApproved = await tryAutoApproveValidation(jobId);
+  if (preApproved) return preApproved;
+
   const hook = billingValidationHook.create({ token: toolCallId });
 
   await markHumanValidationRequested(jobId, hook.token, summary, toolCallId);
@@ -482,6 +487,39 @@ async function requestHumanValidationTool(
     platformId: validation.platformId,
     platformCredentialId: validation.platformCredentialId,
     validatedData: validation.validatedData,
+  };
+}
+
+async function tryAutoApproveValidation(jobId: string) {
+  "use step";
+
+  const [job] = await db
+    .select({ platformId: jobs.platformId, platformCredentialId: jobs.platformCredentialId })
+    .from(jobs)
+    .where(eq(jobs.id, jobId))
+    .limit(1);
+
+  if (!job?.platformId || !job?.platformCredentialId) return null;
+
+  await db
+    .update(jobs)
+    .set({ status: "approved", updatedAt: new Date() })
+    .where(eq(jobs.id, jobId));
+
+  await emit(jobId, "validation_approved", "Validacao auto-aprovada via API.", {
+    agentStep: "request_human_validation",
+    toolName: "requestHumanValidation",
+    nodeId: "human_validation",
+    status: "success",
+    autoApproved: true,
+    redacted: true,
+  });
+
+  return {
+    approved: true,
+    platformId: job.platformId,
+    platformCredentialId: job.platformCredentialId,
+    validatedData: {} as Record<string, unknown>,
   };
 }
 
