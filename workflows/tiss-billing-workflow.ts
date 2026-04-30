@@ -3,7 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { stepCountIs, type ModelMessage, type StepResult, type ToolSet } from "ai";
 import { webSearch } from "@exalabs/ai-sdk";
 import { DurableAgent } from "@workflow/ai/agent";
-import { defineHook, getWritable } from "workflow";
+import { defineHook, FatalError, getWritable } from "workflow";
 import { z } from "zod";
 import { buildOrizonBillingAgentInstructions } from "@/lib/agents/orizon-billing-agent-config";
 import {
@@ -520,48 +520,53 @@ async function fillOrizonCredentialsTool(
 ) {
   "use step";
 
-  const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
+  // Pre-flight: load + validate inputs before any browser work. Any throw here
+  // is permanent (bad config / corrupted credential) — surface it in the
+  // timeline and skip the workflow's default 3 retries via FatalError.
+  let job: typeof jobs.$inferSelect | undefined;
+  let credential: typeof platformCredentials.$inferSelect | undefined;
+  let tissFiles: Awaited<ReturnType<typeof loadTissFiles>>;
+  let password: string;
+  try {
+    [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
+    if (!job) throw new Error("Job nao encontrado.");
 
-  if (!job) {
-    throw new Error("Job nao encontrado.");
-  }
-
-  const [credential] = await db
-    .select()
-    .from(platformCredentials)
-    .where(
-      and(
-        eq(platformCredentials.id, platformCredentialId),
-        eq(platformCredentials.userId, job.userId),
-      ),
-    )
-    .limit(1);
-
-  if (!credential) {
-    throw new Error("Credencial da plataforma nao encontrada.");
-  }
-
-  const files = await db.select().from(jobFiles).where(eq(jobFiles.jobId, jobId));
-
-  if (files.length === 0) {
-    throw new Error("Nenhum arquivo associado ao job.");
-  }
-
-  for (const f of files) {
-    if (!f.fileName.toLowerCase().endsWith(".zip")) {
+    [credential] = await db
+      .select()
+      .from(platformCredentials)
+      .where(
+        and(
+          eq(platformCredentials.id, platformCredentialId),
+          eq(platformCredentials.userId, job.userId),
+        ),
+      )
+      .limit(1);
+    if (!credential) {
       throw new Error(
-        `O portal Orizon Fature so aceita arquivos .zip; reenvie '${f.fileName}' compactado.`,
+        `Credencial '${platformCredentialId}' nao encontrada para este usuario.`,
       );
     }
-  }
 
-  const tissFiles = await Promise.all(
-    files.map(async (f) => ({
-      fileName: f.fileName,
-      bytes: Buffer.from(await readUploadBytes(f.blobUrl)),
-      contentType: f.contentType,
-    })),
-  );
+    tissFiles = await loadTissFiles(jobId);
+
+    try {
+      password = decryptSecret({
+        encryptedValue: credential.encryptedPassword,
+        iv: credential.iv,
+        authTag: credential.authTag,
+      });
+    } catch (cause) {
+      throw new Error(
+        `Falha ao descriptografar a credencial '${platformCredentialId}'. CREDENTIAL_ENCRYPTION_KEY mudou desde que a credencial foi salva — re-cadastre a senha em Plataformas para re-encriptar com a chave atual. (${
+          cause instanceof Error ? cause.message : String(cause)
+        })`,
+      );
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Falha de pre-flight do login.";
+    await reportFillCredentialsFailure(jobId, message, credential?.username);
+    throw new FatalError(message);
+  }
 
   await db
     .update(jobs)
@@ -585,21 +590,6 @@ async function fillOrizonCredentialsTool(
     status: "running",
     redacted: true,
     usernameMasked: maskUsername(credential.username),
-  });
-
-  await emit(jobId, "browser_session_started", "Sessao Browserbase preparada para o Orizon.", {
-    agentStep: "prepare_browser_session",
-    toolName: "fillOrizonCredentials",
-    nodeId: "browserbase_session",
-    status: "running",
-    redacted: true,
-    runtime: resolveBrowserRuntime(),
-  });
-
-  const password = decryptSecret({
-    encryptedValue: credential.encryptedPassword,
-    iv: credential.iv,
-    authTag: credential.authTag,
   });
 
   const userPrefs = await getUserPreferences(job.userId);
@@ -649,7 +639,7 @@ async function fillOrizonCredentialsTool(
       redacted: true,
     });
 
-    throw error;
+    throw new FatalError(message);
   }
 
   if (!result.ok) {
@@ -766,6 +756,46 @@ async function fillOrizonCredentialsTool(
   };
 }
 
+async function loadTissFiles(jobId: string) {
+  const files = await db.select().from(jobFiles).where(eq(jobFiles.jobId, jobId));
+  if (files.length === 0) {
+    throw new Error("Nenhum arquivo associado ao job.");
+  }
+  for (const f of files) {
+    if (!f.fileName.toLowerCase().endsWith(".zip")) {
+      throw new Error(
+        `O portal Orizon Fature so aceita arquivos .zip; reenvie '${f.fileName}' compactado.`,
+      );
+    }
+  }
+  return Promise.all(
+    files.map(async (f) => ({
+      fileName: f.fileName,
+      bytes: Buffer.from(await readUploadBytes(f.blobUrl)),
+      contentType: f.contentType,
+    })),
+  );
+}
+
+async function reportFillCredentialsFailure(
+  jobId: string,
+  message: string,
+  username: string | undefined,
+) {
+  await db
+    .update(jobs)
+    .set({ status: "failed", errorMessage: message, updatedAt: new Date() })
+    .where(eq(jobs.id, jobId));
+  await emit(jobId, "agent_tool_completed", message, {
+    agentStep: "login_orizon",
+    toolName: "fillOrizonCredentials",
+    nodeId: "error",
+    status: "failed",
+    redacted: true,
+    ...(username ? { usernameMasked: maskUsername(username) } : {}),
+  });
+}
+
 const submitProgressMessages: Record<string, string> = {
   popup_dismissed: "Popups iniciais fechados.",
   upload_page_opened: "Pagina de envio TISS aberta.",
@@ -787,6 +817,20 @@ async function emitSubmitProgress(
   jobId: string,
   event: import("@/lib/browser-adapters/orizon-fature").OrizonProgressEvent,
 ) {
+  if (event.stage === "session_created") {
+    await emit(jobId, "browser_session_started", "Sessao Browserbase criada para o Orizon.", {
+      agentStep: "prepare_browser_session",
+      toolName: "fillOrizonCredentials",
+      nodeId: "browserbase_session",
+      status: "running",
+      redacted: true,
+      runtime: resolveBrowserRuntime(),
+      sessionId: event.sessionId,
+      ...(event.debugUrl ? { debugUrl: event.debugUrl } : {}),
+    });
+    return;
+  }
+
   const message =
     event.stage === "log" ? event.message : submitProgressMessages[event.stage] ?? "Etapa de envio TISS.";
   const payload: Record<string, unknown> = {

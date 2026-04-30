@@ -69,6 +69,7 @@ export type OrizonLoginInput = {
 };
 
 export type OrizonProgressEvent =
+  | { stage: "session_created"; sessionId: string; debugUrl?: string }
   | { stage: "popup_dismissed" }
   | { stage: "upload_page_opened" }
   | { stage: "file_uploaded" }
@@ -135,6 +136,7 @@ async function loginWithBrowserbase(input: OrizonLoginInput): Promise<OrizonLogi
             : "login",
     },
   });
+  await input.onProgress?.({ stage: "session_created", sessionId: session.id });
   const browser = await chromium.connectOverCDP(session.connectUrl);
 
   try {
