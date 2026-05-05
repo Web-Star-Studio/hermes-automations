@@ -78,6 +78,7 @@ export const jobStatusEnum = pgEnum("job_status", [
   "running",
   "login_succeeded",
   "failed",
+  "awaiting_recovery",
 ]);
 
 export const platformIdEnum = pgEnum("platform_id", ["orizon_fature"]);
@@ -136,6 +137,7 @@ export const jobs = pgTable(
     ),
     validationHookToken: text("validation_hook_token"),
     errorMessage: text("error_message"),
+    pendingStepRecovery: jsonb("pending_step_recovery").$type<PendingStepRecovery | null>(),
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
@@ -144,6 +146,25 @@ export const jobs = pgTable(
     index("jobs_status_idx").on(table.status),
   ],
 );
+
+export type PendingStepRecovery = {
+  stepName: string;
+  goal: string;
+  attemptsUsed: number;
+  lastError: string;
+  visionSummaries: Array<{ approach: string; outcome: string }>;
+  screenshotKey: string | null;
+  snapshotKey: string | null;
+  context?: { pageId?: string; modalId?: string; elementId?: string };
+  suspendedAt: string;
+  // Operator's resolution from /api/jobs/[jobId]/resume-recovery, consumed
+  // by the step runner on the next workflow run for this job.
+  operatorResolution?:
+    | { resolution: "retry" }
+    | { resolution: "skip" }
+    | { resolution: "fail"; reason?: string }
+    | { resolution: "manual_selector"; selector: string; verb?: "click" | "fill" | "select" | "check" | "scroll" };
+};
 
 export const jobFiles = pgTable(
   "job_files",

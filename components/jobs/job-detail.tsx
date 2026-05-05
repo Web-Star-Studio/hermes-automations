@@ -19,6 +19,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { BrowserbaseSessionsCard } from "@/components/jobs/browserbase-sessions-card";
 import type { JobWorkflowEdge, JobWorkflowNode } from "@/lib/jobs/workflow-visualization";
+import type { PendingStepRecovery } from "@/lib/db/schema";
 import type { TissExpanded, TissGuideSummary, TissProcedureCode } from "@/lib/tiss/parser";
 
 const JobWorkflowCanvas = dynamic(
@@ -45,6 +46,7 @@ type JobDetailResponse = {
     flowType: keyof typeof jobFlowLabels;
     runId: string | null;
     errorMessage: string | null;
+    pendingStepRecovery: PendingStepRecovery | null;
   };
   file: { fileName: string; size: string; checksum: string } | null;
   files: Array<{ id: string; fileName: string; size: string; checksum: string; contentType: string }>;
@@ -235,6 +237,14 @@ export function JobDetail({ jobId }: { jobId: string }) {
               />
             </div>
           </div>
+
+          {data.job.pendingStepRecovery && data.job.status === "awaiting_recovery" ? (
+            <StepRecoveryPanel
+              jobId={jobId}
+              pending={data.job.pendingStepRecovery}
+              onResolved={() => mutate()}
+            />
+          ) : null}
 
           <AgentTimeline events={timelineEvents} />
           <BrowserbaseSessionsCard jobId={jobId} />
@@ -475,6 +485,120 @@ function BeneficiariesAndGuides({
             ))}
           </div>
         )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function StepRecoveryPanel({
+  jobId,
+  pending,
+  onResolved,
+}: {
+  jobId: string;
+  pending: PendingStepRecovery;
+  onResolved: () => void;
+}) {
+  const [error, setError] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+  const [manualSelector, setManualSelector] = useState("");
+
+  function resolve(body: Record<string, unknown>) {
+    setError(null);
+    startTransition(async () => {
+      const response = await fetch(`/api/jobs/${jobId}/resume-recovery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload?.ok) {
+        setError(payload?.error?.message ?? "Não foi possível resolver a etapa.");
+        return;
+      }
+      onResolved();
+    });
+  }
+
+  return (
+    <Card className="border-amber-500/40 bg-amber-50/30 dark:bg-amber-950/20">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Wrench className="size-4" /> Etapa aguardando decisão
+        </CardTitle>
+        <CardDescription>
+          O agente exauriu retentativas determinísticas e de visão computacional. Escolha como prosseguir.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 text-sm md:grid-cols-2">
+          <ReadOnlyField label="Etapa" value={pending.stepName} />
+          <ReadOnlyField label="Tentativas" value={String(pending.attemptsUsed)} />
+          <div className="md:col-span-2">
+            <Label className="mb-1 block text-xs uppercase tracking-wide">Objetivo</Label>
+            <p className="rounded border bg-background p-2 text-xs leading-relaxed">{pending.goal}</p>
+          </div>
+          <div className="md:col-span-2">
+            <Label className="mb-1 block text-xs uppercase tracking-wide">Último erro</Label>
+            <p className="rounded border bg-background p-2 font-mono text-xs leading-relaxed">{pending.lastError}</p>
+          </div>
+        </div>
+
+        {pending.visionSummaries.length > 0 ? (
+          <div>
+            <Label className="mb-1 block text-xs uppercase tracking-wide">Tentativas anteriores</Label>
+            <ol className="space-y-1 rounded border bg-background p-2 text-xs">
+              {pending.visionSummaries.map((s, i) => (
+                <li key={i}>
+                  <span className="font-medium">{s.approach}</span>{" "}
+                  <span className="text-muted-foreground">— {s.outcome}</span>
+                </li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
+
+        <div className="space-y-2">
+          <Label className="text-xs uppercase tracking-wide">Seletor manual (opcional)</Label>
+          <Input
+            placeholder='ex.: button#botaoAssinarEnviar.orange'
+            value={manualSelector}
+            onChange={(e) => setManualSelector(e.target.value)}
+            disabled={isPending}
+          />
+        </div>
+
+        {error ? (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        ) : null}
+
+        <div className="flex flex-wrap gap-2">
+          <Button
+            onClick={() => resolve({ resolution: "retry" })}
+            disabled={isPending}
+            variant="default"
+          >
+            {isPending ? <Loader2 className="size-4 animate-spin" /> : null}
+            Tentar novamente
+          </Button>
+          <Button
+            onClick={() =>
+              resolve({ resolution: "manual_selector", selector: manualSelector })
+            }
+            disabled={isPending || manualSelector.trim().length === 0}
+            variant="secondary"
+          >
+            Usar seletor manual
+          </Button>
+          <Button onClick={() => resolve({ resolution: "skip" })} disabled={isPending} variant="outline">
+            Pular etapa
+          </Button>
+          <Button onClick={() => resolve({ resolution: "fail" })} disabled={isPending} variant="destructive">
+            Marcar como falha
+          </Button>
+        </div>
       </CardContent>
     </Card>
   );

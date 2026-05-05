@@ -33,6 +33,8 @@ import { decryptSecret } from "@/lib/security/credentials";
 import { getUserPreferences } from "@/lib/db/user-preferences";
 import { readUploadBytes } from "@/lib/storage/read-upload";
 import { extractXmlDocuments, parseTissXml, type TissSummary } from "@/lib/tiss/parser";
+import { createAwaitHumanRecovery } from "@/lib/jobs/step-recovery";
+import { StepRecoveryRequired } from "@/lib/browser-adapters/orizon-fature/step-runner";
 
 export type BillingWorkflowEvent = {
   type: string;
@@ -648,8 +650,26 @@ async function fillOrizonCredentialsTool(
       onProgress: async (event) => {
         await emitSubmitProgress(jobId, event);
       },
+      awaitHumanRecovery: createAwaitHumanRecovery(jobId),
     });
   } catch (error) {
+    // The step runner exhausted retries and persisted a recovery payload to
+    // `jobs.pendingStepRecovery`. Job is already in `awaiting_recovery` —
+    // surface a non-retrying FatalError without rewriting status to failed.
+    if (error instanceof StepRecoveryRequired) {
+      const message = `Etapa "${error.payload.stepName}" pausada para revisão humana: ${error.payload.lastError}`;
+      await emit(jobId, "agent_tool_completed", message, {
+        agentStep: "login_orizon",
+        toolName: "fillOrizonCredentials",
+        nodeId: "step_recovery",
+        status: "awaiting_human",
+        stepName: error.payload.stepName,
+        attemptsUsed: error.payload.attemptsUsed,
+        redacted: true,
+      });
+      throw new FatalError(message);
+    }
+
     const message = error instanceof Error ? error.message : "Falha ao iniciar sessao Browserbase.";
 
     await db
@@ -848,6 +868,10 @@ const submitProgressMessages: Record<string, string> = {
   guide_saved: "Guia salva no portal.",
   guide_failed: "Falha ao salvar guia no portal.",
   vision_recovery: "Visão (LLM) usada para localizar elemento na pagina.",
+  step_started: "Etapa iniciada.",
+  step_succeeded: "Etapa concluída.",
+  step_alternative_used: "Tentativa alternativa de etapa.",
+  step_unrecoverable: "Etapa irrecuperável — aguardando operador.",
   log: "Log do adaptador Orizon.",
 };
 
@@ -882,6 +906,34 @@ async function emitSubmitProgress(
   if (event.stage === "vision_recovery") {
     payload.intent = event.intent;
     if (event.selector) payload.selector = event.selector;
+    if (event.stepName) payload.stepName = event.stepName;
+    if (typeof event.attemptIndex === "number") payload.attemptIndex = event.attemptIndex;
+    if (typeof event.previousAttemptCount === "number")
+      payload.previousAttemptCount = event.previousAttemptCount;
+  }
+  if (
+    event.stage === "step_started" ||
+    event.stage === "step_succeeded" ||
+    event.stage === "step_alternative_used" ||
+    event.stage === "step_unrecoverable"
+  ) {
+    payload.stepName = event.stepName;
+  }
+  if (event.stage === "step_started") {
+    payload.goal = event.goal;
+  }
+  if (event.stage === "step_succeeded") {
+    payload.durationMs = event.durationMs;
+    payload.attemptsUsed = event.attemptsUsed;
+    payload.status = "success";
+  }
+  if (event.stage === "step_alternative_used") {
+    payload.alternativeName = event.alternativeName;
+  }
+  if (event.stage === "step_unrecoverable") {
+    payload.reason = event.reason;
+    payload.attemptsUsed = event.attemptsUsed;
+    payload.status = "awaiting_human";
   }
   if ("guideIndex" in event) {
     payload.guideIndex = event.guideIndex;

@@ -7,6 +7,7 @@ export const jobStatusLabels: Record<JobStatus, string> = {
   running: "Executando",
   login_succeeded: "Lote enviado",
   failed: "Falhou",
+  awaiting_recovery: "Aguardando recuperacao",
 };
 
 export const jobStatusTone: Record<JobStatus, "default" | "secondary" | "destructive" | "outline"> =
@@ -17,6 +18,7 @@ export const jobStatusTone: Record<JobStatus, "default" | "secondary" | "destruc
     running: "default",
     login_succeeded: "default",
     failed: "destructive",
+    awaiting_recovery: "outline",
   };
 
 export const jobFlowLabels: Record<JobFlowType, string> = {

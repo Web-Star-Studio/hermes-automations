@@ -19,6 +19,14 @@ import {
   snapshotOpenModalFields,
   snapshotPageFields,
 } from "@/lib/orizon/runtime-introspection";
+import {
+  runStep,
+  type StepDescriptor,
+  type StepProgressEvent,
+  type StepRecoveryPayload,
+  type StepRecoveryResolution,
+  type StepRunOptions,
+} from "./step-runner";
 
 // ─── Public types ─────────────────────────────────────────────────────
 
@@ -66,6 +74,15 @@ export type OrizonLoginInput = {
   guidesToFill?: OrizonGuideToFill[];
   visionEnabled?: boolean;
   onProgress?: (event: OrizonProgressEvent) => Promise<void> | void;
+  /**
+   * Called by the universal step runner when a step exhausts deterministic +
+   * alternative + vision retries. Production wiring persists the diagnostic
+   * to `jobs.pendingStepRecovery` and returns `fail` so the runner throws
+   * StepRecoveryRequired. Tests inject a fake to assert the payload shape.
+   */
+  awaitHumanRecovery?: (
+    payload: import("./step-runner").StepRecoveryPayload,
+  ) => Promise<import("./step-runner").StepRecoveryResolution>;
 };
 
 export type OrizonProgressEvent =
@@ -82,7 +99,18 @@ export type OrizonProgressEvent =
   | { stage: "guide_step_filled"; guideIndex: number; step: number }
   | { stage: "guide_saved"; guideIndex: number }
   | { stage: "guide_failed"; guideIndex: number; reason: string }
-  | { stage: "vision_recovery"; intent: string; selector?: string }
+  | {
+      stage: "vision_recovery";
+      intent: string;
+      selector?: string;
+      stepName?: string;
+      attemptIndex?: number;
+      previousAttemptCount?: number;
+    }
+  | { stage: "step_started"; stepName: string; goal: string }
+  | { stage: "step_succeeded"; stepName: string; durationMs: number; attemptsUsed: number }
+  | { stage: "step_alternative_used"; stepName: string; alternativeName: string }
+  | { stage: "step_unrecoverable"; stepName: string; reason: string; attemptsUsed: number }
   | { stage: "log"; message: string };
 
 export type OrizonLoginResult = {
@@ -153,12 +181,71 @@ async function loginWithBrowserbase(input: OrizonLoginInput): Promise<OrizonLogi
 
 // ─── Flow orchestration ───────────────────────────────────────────────
 
+/**
+ * Per-flow bundle threaded through every step. Lets `runStep` plug into
+ * progress events + human recovery without each helper taking 5 separate args.
+ */
+type StepContext = {
+  page: Page;
+  jobId: string;
+  visionEnabled: boolean;
+  onProgress?: OrizonLoginInput["onProgress"];
+  awaitHumanRecovery: (payload: StepRecoveryPayload) => Promise<StepRecoveryResolution>;
+};
+
+function buildStepContext(page: Page, input: OrizonLoginInput): StepContext {
+  return {
+    page,
+    jobId: input.jobId ?? "unknown",
+    visionEnabled: input.visionEnabled === true,
+    onProgress: input.onProgress,
+    awaitHumanRecovery:
+      input.awaitHumanRecovery ??
+      (async () => ({
+        // No workflow wired the callback (e.g., test harness). Surface as fail
+        // so the runner throws StepRecoveryRequired upward — caller decides.
+        resolution: "fail",
+        reason: "awaitHumanRecovery not configured for this run.",
+      })),
+  };
+}
+
+/** Bridge runner progress events into the adapter's existing onProgress stream. */
+function bridgeStepProgress(ctx: StepContext): StepRunOptions["onProgress"] {
+  return async (event: StepProgressEvent) => {
+    if (!ctx.onProgress) return;
+    if (event.stage === "vision_recovery") {
+      await ctx.onProgress({
+        stage: "vision_recovery",
+        intent: event.intent,
+        selector: event.selector,
+        stepName: event.stepName,
+        attemptIndex: event.attemptIndex,
+        previousAttemptCount: event.previousAttemptCount,
+      });
+      return;
+    }
+    await ctx.onProgress(event);
+  };
+}
+
+async function step<T>(ctx: StepContext, descriptor: StepDescriptor<T>): Promise<T> {
+  return runStep(descriptor, {
+    page: ctx.page,
+    jobId: ctx.jobId,
+    visionEnabled: ctx.visionEnabled,
+    onProgress: bridgeStepProgress(ctx),
+    awaitHumanRecovery: ctx.awaitHumanRecovery,
+  });
+}
+
 async function performFlow(
   browser: Browser,
   input: OrizonLoginInput,
 ): Promise<Omit<OrizonLoginResult, "mode">> {
   const page = await browser.newPage();
-  const visionEnabled = input.visionEnabled === true;
+  const ctx = buildStepContext(page, input);
+  const visionEnabled = ctx.visionEnabled;
 
   try {
     await navigateToFatureLogin(page, visionEnabled, input.onProgress);
@@ -184,10 +271,10 @@ async function performFlow(
     }
 
     if (input.flowType === "complete") {
-      return await runFluxoCompleto(page, input, visionEnabled);
+      return await runFluxoCompleto(page, input, visionEnabled, ctx);
     }
 
-    return await runFluxoCurto(page, input, visionEnabled);
+    return await runFluxoCurto(page, input, visionEnabled, ctx);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Falha durante envio TISS.";
     return { ok: false, finalUrl: page.url(), message };
@@ -200,30 +287,99 @@ async function runFluxoCurto(
   page: Page,
   input: OrizonLoginInput,
   visionEnabled: boolean,
+  ctx: StepContext,
 ): Promise<Omit<OrizonLoginResult, "mode">> {
-  await openUploadPage(page, visionEnabled, input.onProgress);
+  await step(ctx, {
+    name: "open_upload_page",
+    goal:
+      "Click the 'Enviar XML TISS' tile in the left sidebar to navigate to the upload page where the file picker is visible.",
+    context: { pageId: "dashboard", elementId: "enviarXmlTissSidebar" },
+    attempt: () => openUploadPage(page, visionEnabled, input.onProgress),
+    verify: async () =>
+      await page
+        .getByText(/selecione um ou mais arquivos compactados/i)
+        .first()
+        .isVisible({ timeout: 1_000 })
+        .catch(() => false),
+  });
   await input.onProgress?.({ stage: "upload_page_opened" });
 
-  await acceptSupportTerms(page);
+  await step(ctx, {
+    name: "accept_support_terms",
+    goal:
+      "If a 'Termo de Suporte' modal is open, scroll its body to the bottom, check the agreement checkbox (#Li_Concordo_Suporte) and dismiss the modal so the underlying upload page becomes interactive (no .modal-backdrop in DOM).",
+    context: { pageId: "uploadTiss" },
+    attempt: () => acceptSupportTerms(page),
+    verify: async () => {
+      const modalGone = !(await page
+        .locator("#Li_Concordo_Suporte")
+        .first()
+        .isVisible({ timeout: 500 })
+        .catch(() => false));
+      const noBackdrop = (await page.locator(".modal-backdrop").count().catch(() => 0)) === 0;
+      return modalGone && noBackdrop;
+    },
+  });
 
-  await uploadTissBatch(page, input.tissFiles ?? []);
+  await step(ctx, {
+    name: "upload_tiss_batch",
+    goal:
+      "Pass the buffered TISS files into the upload form's file input so the portal renders one row per file with green check marks. This is a setInputFiles call, not a click — vision cannot help here.",
+    context: { pageId: "uploadTiss", elementId: "fileInput" },
+    attempt: () => uploadTissBatch(page, input.tissFiles ?? []),
+    unrecoverable: true, // No vision can fix a setInputFiles failure.
+  });
   await input.onProgress?.({ stage: "file_uploaded" });
 
-  await selectAllBatches(page, visionEnabled, input.onProgress);
+  // Defense in depth: any earlier modal (cookieBanner, comunicadoInicial,
+  // Termo de Suporte) that closed via a non-Bootstrap path can leave its
+  // backdrop mounted. Strip it before the click-driven steps so select-all
+  // and Enviar aren't silently intercepted.
+  await removeStuckBackdrops(page);
+
+  await step(ctx, {
+    name: "select_all_batches",
+    goal:
+      "Click the column-header 'select all' checkbox (input.ckbExcluirTodosArquivo) so every uploaded file row gets checked and the orange Enviar button enables.",
+    context: { pageId: "uploadTiss", elementId: "selectAllCheckbox" },
+    attempt: () => selectAllBatches(page, visionEnabled, input.onProgress),
+    verify: async () =>
+      await page.locator("input.ckbExcluirTodosArquivo").first().isChecked().catch(() => false),
+  });
   await input.onProgress?.({ stage: "batches_selected" });
 
-  await submitBatches(page, visionEnabled, input.onProgress);
+  await step(ctx, {
+    name: "submit_batches",
+    goal:
+      "Click the orange 'Enviar' button (#botaoAssinarEnviar.orange) at the bottom of the upload list to open the 'Confirmar dados dos lotes' modal where each batch shows 'Validando…' then a per-row valid/invalid label.",
+    context: { pageId: "uploadTiss", elementId: "enviarButton" },
+    attempt: () => submitBatches(page, visionEnabled, input.onProgress),
+    verify: async () =>
+      await page
+        .locator('.modal.in, .modal.show, [role="dialog"]:not([aria-hidden="true"])')
+        .filter({ hasText: /confirmar dados dos lotes/i })
+        .first()
+        .isVisible({ timeout: 5_000 })
+        .catch(() => false),
+  });
   await input.onProgress?.({ stage: "submitted" });
 
-  await confirmSubmission(
-    page,
-    visionEnabled,
-    (input.tissFiles ?? []).length,
-    input.onProgress,
-  );
+  await step(ctx, {
+    name: "confirm_submission",
+    goal:
+      "Wait for every per-row 'Validando…' state inside the 'Confirmar dados dos lotes' modal to settle into 'Arquivo válido para envio.' or 'Arquivo inválido', then click 'Enviar arquivos válidos' to commit the submission.",
+    context: { pageId: "confirmBatchesModal", elementId: "enviarValidosButton" },
+    attempt: () =>
+      confirmSubmission(page, visionEnabled, (input.tissFiles ?? []).length, input.onProgress),
+  });
   await input.onProgress?.({ stage: "confirmed" });
 
-  await awaitSubmissionSuccess(page, visionEnabled, input.onProgress);
+  await step(ctx, {
+    name: "await_submission_success",
+    goal:
+      "Wait up to 60s for the post-submit success modal titled 'Lotes enviados com sucesso!' to appear and click its 'Enviar mais lotes' button to fully close it.",
+    attempt: () => awaitSubmissionSuccess(page, visionEnabled, input.onProgress),
+  });
   await input.onProgress?.({ stage: "submission_succeeded" });
 
   return {
@@ -238,7 +394,11 @@ async function runFluxoCompleto(
   page: Page,
   input: OrizonLoginInput,
   visionEnabled: boolean,
+  _ctx: StepContext,
 ): Promise<Omit<OrizonLoginResult, "mode">> {
+  // TODO: migrate selectOperadoraByAns / selectTipoGuia / fillGuideStep /
+  // advanceGuideStep / addProcedimento / salvarGuia to runStep using `_ctx`.
+  // Pattern is identical to runFluxoCurto above. Tracked in plan phase 3.
   await openDigitarGuiaPage(page, visionEnabled, input.onProgress);
   await input.onProgress?.({ stage: "digitar_guia_opened" });
   await dismissTourOverlay(page);
@@ -420,8 +580,12 @@ async function acceptSupportTerms(page: Page) {
   const termsCheckbox = page.locator("#Li_Concordo_Suporte").first();
   if (!(await termsCheckbox.count().catch(() => 0))) return;
 
+  // Scope to the OPEN dialog containing the support-terms checkbox. The previous
+  // selector `[role="dialog"], [class*="modal"], [class*="Modal"]` matched any
+  // modal-shaped element on the page (including hidden Angular templates).
   const dialog = page
-    .locator('[role="dialog"], [class*="modal"], [class*="Modal"]')
+    .locator('.modal.in, .modal.show, [role="dialog"]:not([aria-hidden="true"])')
+    .filter({ has: page.locator("#Li_Concordo_Suporte") })
     .first();
 
   for (let attempt = 0; attempt < 8; attempt++) {
@@ -448,15 +612,66 @@ async function acceptSupportTerms(page: Page) {
     await termsCheckbox.click({ force: true, timeout: 5_000 }).catch(() => undefined);
   });
 
-  const acceptButton = page
-    .getByRole("button", { name: /^(aceitar|aceito|continuar|concordar|prosseguir|ok)$/i })
-    .or(page.locator('button:has-text("Aceitar")'))
-    .or(page.locator('button:has-text("Continuar")'))
+  // Scope the accept button to the open dialog so we don't accidentally hit an
+  // unrelated "OK" elsewhere on the page (which would leave the support modal
+  // open and its backdrop stuck on the upload page).
+  const acceptInDialog = dialog
+    .locator(
+      [
+        'button:has-text("Aceitar")',
+        'button:has-text("Aceito")',
+        'button:has-text("Concordar")',
+        'button:has-text("Concordo")',
+        'button:has-text("Continuar")',
+        'button:has-text("Prosseguir")',
+        'button:has-text("Confirmar")',
+        'button:has-text("Avançar")',
+        'button:has-text("Avancar")',
+        'button[data-dismiss="modal"]',
+        'button.close',
+      ].join(", "),
+    )
     .first();
-  if (await acceptButton.isVisible({ timeout: 2_000 }).catch(() => false)) {
-    await acceptButton.click({ timeout: 5_000 }).catch(() => undefined);
+  if (await acceptInDialog.isVisible({ timeout: 2_000 }).catch(() => false)) {
+    await acceptInDialog.click({ timeout: 5_000 }).catch(() => undefined);
     await page.waitForTimeout(800);
   }
+
+  // Verify the modal actually closed. If the click above missed (button text
+  // changed, click intercepted, etc.), Bootstrap leaves <div class="modal-backdrop">
+  // mounted at z-index ~1040 and every subsequent click on the upload page is
+  // intercepted (select-all silently no-ops; "Enviar" times out). Force a close
+  // through Bootstrap's API when possible, then fall back to stripping the DOM.
+  const stillOpen = await dialog.isVisible({ timeout: 500 }).catch(() => false);
+  if (stillOpen) {
+    await page
+      .evaluate(() => {
+        const w = window as unknown as {
+          jQuery?: (sel: string) => { modal: (action: string) => unknown; length: number };
+          $?: (sel: string) => { modal: (action: string) => unknown; length: number };
+        };
+        const jq = w.jQuery ?? w.$;
+        if (jq) {
+          try {
+            jq(".modal.in, .modal.show").modal("hide");
+          } catch {
+            // ignore — fall through to manual cleanup below
+          }
+        }
+        document
+          .querySelectorAll('.modal.in, .modal.show, [role="dialog"]:not([aria-hidden="true"])')
+          .forEach((el) => {
+            const html = el as HTMLElement;
+            html.classList.remove("in", "show");
+            html.style.display = "none";
+            html.setAttribute("aria-hidden", "true");
+          });
+      })
+      .catch(() => undefined);
+    await page.waitForTimeout(400);
+  }
+
+  await removeStuckBackdrops(page);
 }
 
 async function tryClickModalAction(page: Page, modalId: string): Promise<boolean> {
@@ -471,6 +686,35 @@ async function tryClickModalAction(page: Page, modalId: string): Promise<boolean
     // Fall through.
   }
   return false;
+}
+
+async function removeStuckBackdrops(page: Page) {
+  // Bootstrap leaves <div class="modal-backdrop fade in"> mounted (z-index ~1040)
+  // when a modal is dismissed via a non-Bootstrap path or its hide animation is
+  // interrupted. The orphaned backdrop intercepts every pointer event on the
+  // underlying page — checkbox toggles silently no-op (force-click bypass still
+  // dispatches at the wrong target) and "Enviar" times out with
+  // `<div class="modal-backdrop fade in"> intercepts pointer events`.
+  // Only strip backdrops when no modal is actually visible — otherwise we'd
+  // break a legitimately-open modal (e.g., the post-Enviar confirmation).
+  await page
+    .evaluate(() => {
+      const modalIsOpen = Array.from(
+        document.querySelectorAll('.modal.in, .modal.show, [role="dialog"]:not([aria-hidden="true"])'),
+      ).some((m) => {
+        const html = m as HTMLElement;
+        if (html.offsetParent === null) return false;
+        const rect = html.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+      if (modalIsOpen) return;
+
+      document.querySelectorAll(".modal-backdrop").forEach((el) => el.remove());
+      document.body.classList.remove("modal-open");
+      document.body.style.removeProperty("padding-right");
+      document.body.style.removeProperty("overflow");
+    })
+    .catch(() => undefined);
 }
 
 // ─── Short flow helpers ───────────────────────────────────────────────
