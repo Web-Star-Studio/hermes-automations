@@ -1263,6 +1263,11 @@ async function runPortalActionsTool(
     connectUrl: row.connectUrl,
     actions,
     visionEnabled: userPrefs.browserVisionEnabled,
+    jobId,
+    awaitHumanRecovery: createAwaitHumanRecovery(jobId),
+    onProgress: async (event) => {
+      await emitSubmitProgress(jobId, event);
+    },
   });
 
   await db

@@ -394,12 +394,15 @@ async function runFluxoCompleto(
   page: Page,
   input: OrizonLoginInput,
   visionEnabled: boolean,
-  _ctx: StepContext,
+  ctx: StepContext,
 ): Promise<Omit<OrizonLoginResult, "mode">> {
-  // TODO: migrate selectOperadoraByAns / selectTipoGuia / fillGuideStep /
-  // advanceGuideStep / addProcedimento / salvarGuia to runStep using `_ctx`.
-  // Pattern is identical to runFluxoCurto above. Tracked in plan phase 3.
-  await openDigitarGuiaPage(page, visionEnabled, input.onProgress);
+  await step(ctx, {
+    name: "open_digitar_guia",
+    goal:
+      "Open the 'Digitar Guia' page from the sidebar so the operadora + tipo dropdowns and the proceed button become visible.",
+    context: { pageId: "dashboard" },
+    attempt: () => openDigitarGuiaPage(page, visionEnabled, input.onProgress),
+  });
   await input.onProgress?.({ stage: "digitar_guia_opened" });
   await dismissTourOverlay(page);
 
@@ -425,7 +428,7 @@ async function runFluxoCompleto(
         tipoId: guide.tipoId,
         label: guide.label,
       });
-      await fillAndSaveGuide(page, guide, visionEnabled, input.onProgress);
+      await fillAndSaveGuide(page, guide, visionEnabled, input.onProgress, ctx);
       saved++;
       await input.onProgress?.({ stage: "guide_saved", guideIndex: guide.index });
 
@@ -1400,36 +1403,106 @@ async function fillAndSaveGuide(
   page: Page,
   guide: OrizonGuideToFill,
   visionEnabled: boolean,
-  onProgress?: OrizonLoginInput["onProgress"],
+  onProgress: OrizonLoginInput["onProgress"] | undefined,
+  ctx: StepContext,
 ) {
-  // 1) On the digitar_guia entry, select operadora + tipo and submit.
-  await selectOperadoraByAns(page, guide.operadoraAns);
-  await selectTipoGuia(page, guide.tipoId);
-  await clickDigitarGuiaSubmit(page, visionEnabled, onProgress);
-  await dismissTourOverlay(page);
-
   const tipo = orizonFaturePortalMap.guideTypes[guide.tipoId];
+
+  // 1) On the digitar_guia entry, select operadora + tipo and submit.
+  await step(ctx, {
+    name: `select_operadora_ans_${guide.operadoraAns}`,
+    goal: `Pick the operadora option whose visible text contains "(ANS: ${guide.operadoraAns})" from the operadora dropdown (#operadora) and trigger Angular's change so the next dropdown becomes valid.`,
+    context: { pageId: "digitarGuia" },
+    attempt: () => selectOperadoraByAns(page, guide.operadoraAns),
+    verify: async () =>
+      await page
+        .evaluate((wantedAns: string) => {
+          const sel = document.getElementById("operadora") as HTMLSelectElement | null;
+          if (!sel) return false;
+          const re = new RegExp(`\\bANS:\\s*0*${wantedAns}\\b`, "i");
+          return re.test(sel.options[sel.selectedIndex]?.textContent ?? "");
+        }, String(guide.operadoraAns))
+        .catch(() => false),
+  });
+
+  await step(ctx, {
+    name: `select_tipo_guia_${guide.tipoId}`,
+    goal: `Set the tipo de guia dropdown (#tipoDeGuia) to the option whose value is "${tipo.selectValue}" (${guide.tipoId}) and trigger Angular's change.`,
+    context: { pageId: "digitarGuia" },
+    attempt: async () => {
+      await selectTipoGuia(page, guide.tipoId);
+    },
+    verify: async () =>
+      await page
+        .evaluate((expected: string) => {
+          const sel = document.getElementById("tipoDeGuia") as HTMLSelectElement | null;
+          return sel?.value === expected;
+        }, tipo.selectValue)
+        .catch(() => false),
+  });
+
+  await step(ctx, {
+    name: "click_digitar_guia_submit",
+    goal: "Click the orange 'Digitar Guia' button to navigate from the entry page to the guide form for the selected tipo (URL hash should contain guia_consulta / guia_sadt / etc).",
+    context: { pageId: "digitarGuia", elementId: "submitButton" },
+    attempt: () => clickDigitarGuiaSubmit(page, visionEnabled, onProgress),
+    verify: async () => /#\/(guia_consulta|guia_sadt|guia_honorario|guia_internacao|guia_odonto)/.test(page.url()),
+  });
+  await dismissTourOverlay(page);
 
   // 2) Walk steps 1..N-1 (last step is procedimentos + Salvar).
   for (let s = 1; s < tipo.stepCount; s++) {
     const stepValues = guide.steps.find((x) => x.step === s)?.values ?? {};
-    await fillGuideStep(page, guide.tipoId, s, stepValues, {
-      tissData: guide.tissData,
-      visionEnabled,
+    await step(ctx, {
+      name: `fill_guide_step_${guide.tipoId}_${s}`,
+      goal: `Fill every mapped field on step ${s} of the ${guide.tipoId} guide form using the values from the TISS document (or vision-driven fallback for unmapped fields).`,
+      attempt: async () => {
+        await fillGuideStep(page, guide.tipoId, s, stepValues, {
+          tissData: guide.tissData,
+          visionEnabled,
+        });
+      },
+      // No structural verify — fillGuideStep is best-effort for each field
+      // and individual failures already surface as vision_recovery events.
+      // The outer advanceGuideStep verify (URL changed / next-step button
+      // gone) is the real gate.
     });
     await onProgress?.({ stage: "guide_step_filled", guideIndex: guide.index, step: s });
-    await advanceGuideStep(page, guide.tipoId, s, visionEnabled, onProgress);
+
+    await step(ctx, {
+      name: `advance_guide_step_${guide.tipoId}_${s}_to_${s + 1}`,
+      goal: `Click the 'Próxima etapa' button to advance from step ${s} to step ${s + 1} of the ${guide.tipoId} guide form.`,
+      context: { pageId: "digitarGuia" },
+      attempt: () => advanceGuideStep(page, guide.tipoId, s, visionEnabled, onProgress),
+    });
   }
 
-  // 3) Add procedures via the modal handler.
+  // 3) Add procedures via the modal handler. Per-procedure failures don't
+  // abort the whole guide; the runner surfaces them in step_unrecoverable
+  // events but we catch StepRecoveryRequired so the guide still reaches Salvar.
+  const { StepRecoveryRequired: StepRecoveryRequiredCtor } = await import("./step-runner");
   for (const procedure of guide.procedures ?? []) {
-    await addProcedimento(page, guide.tipoId, procedure, visionEnabled, onProgress).catch(() => {
-      // Per-procedure failures don't abort the whole guide — surface via vision_recovery / log.
-    });
+    try {
+      await step(ctx, {
+        name: `add_procedimento_${procedure.codigo}`,
+        goal: `Open the 'Adicionar procedimento' modal, fill TUSS code "${procedure.codigo}" plus any other procedure fields the modal exposes, save, and confirm a new row appears in the procedures table.`,
+        context: { pageId: "digitarGuia" },
+        attempt: () => addProcedimento(page, guide.tipoId, procedure, visionEnabled, onProgress),
+      });
+    } catch (err) {
+      if (!(err instanceof StepRecoveryRequiredCtor)) throw err;
+      // Per-procedure recovery: log and continue. Recovery payload was
+      // already persisted by the runner.
+    }
   }
 
   // 4) Salvar Guia.
-  await salvarGuia(page, guide.tipoId, visionEnabled, onProgress);
+  await step(ctx, {
+    name: "salvar_guia",
+    goal: "Click the green 'Salvar Guia' button to persist the guide on the portal and trigger the success modal/redirect.",
+    context: { pageId: "digitarGuia" },
+    attempt: () => salvarGuia(page, guide.tipoId, visionEnabled, onProgress),
+  });
 }
 
 // ─── Click & vision helpers ───────────────────────────────────────────
@@ -1657,6 +1730,12 @@ export type RunPortalActionsInput = {
   connectUrl: string;
   actions: PortalAction[];
   visionEnabled?: boolean;
+  /** Forwarded to the step runner so granular actions get the same recovery escalation as the monolithic flow. */
+  jobId?: string;
+  awaitHumanRecovery?: (
+    payload: StepRecoveryPayload,
+  ) => Promise<StepRecoveryResolution>;
+  onProgress?: (event: OrizonProgressEvent) => Promise<void> | void;
 };
 
 export type RunPortalActionsResult = {
@@ -1680,12 +1759,23 @@ export async function runPortalActions(
   try {
     const pages = browser.contexts()[0]?.pages() ?? [];
     const page = pages[0] ?? (await browser.newPage());
-    const visionEnabled = input.visionEnabled === true;
+    const ctx: StepContext = {
+      page,
+      jobId: input.jobId ?? "unknown",
+      visionEnabled: input.visionEnabled === true,
+      onProgress: input.onProgress,
+      awaitHumanRecovery:
+        input.awaitHumanRecovery ??
+        (async () => ({
+          resolution: "fail",
+          reason: "awaitHumanRecovery not configured for runPortalActions.",
+        })),
+    };
     const results: PortalActionResult[] = [];
 
     for (const action of input.actions) {
       try {
-        const r = await executeAction(page, action, visionEnabled);
+        const r = await executeAction(page, action, ctx);
         results.push(r);
       } catch (error) {
         const message = error instanceof Error ? error.message : "erro desconhecido";
@@ -1702,35 +1792,85 @@ export async function runPortalActions(
 async function executeAction(
   page: Page,
   action: PortalAction,
-  visionEnabled: boolean,
+  ctx: StepContext,
 ): Promise<PortalActionResult> {
+  const visionEnabled = ctx.visionEnabled;
   switch (action.kind) {
     case "click": {
-      await clickWithVisionFallback({
-        page,
-        pageId: action.pageId,
-        elementId: action.elementId,
-        timeoutMs: 10_000,
-        visionEnabled,
+      await step(ctx, {
+        name: `granular_click_${action.pageId}_${action.elementId}`,
+        goal: `Click the "${action.elementId}" element on page "${action.pageId}".`,
+        context: { pageId: action.pageId, elementId: action.elementId },
+        attempt: () =>
+          clickWithVisionFallback({
+            page,
+            pageId: action.pageId,
+            elementId: action.elementId,
+            timeoutMs: 10_000,
+            visionEnabled,
+            onProgress: ctx.onProgress,
+          }),
       });
       return { kind: "click", ok: true };
     }
     case "fill": {
-      const locator = selectElement(page, action.pageId, action.elementId);
-      await locator.waitFor({ state: "visible", timeout: 10_000 });
-      await fillByLocator(locator, action.value);
+      await step(ctx, {
+        name: `granular_fill_${action.pageId}_${action.elementId}`,
+        goal: `Type "${action.value}" into the "${action.elementId}" field on page "${action.pageId}".`,
+        context: { pageId: action.pageId, elementId: action.elementId },
+        attempt: async () => {
+          const locator = selectElement(page, action.pageId, action.elementId);
+          await locator.waitFor({ state: "visible", timeout: 10_000 });
+          await fillByLocator(locator, action.value);
+        },
+        verify: async () =>
+          (await selectElement(page, action.pageId, action.elementId).inputValue().catch(() => "")) ===
+          action.value,
+        visionAction: async (locator) => {
+          await locator.fill(action.value, { timeout: 10_000 });
+        },
+      });
       return { kind: "fill", ok: true };
     }
     case "select": {
-      const locator = selectElement(page, action.pageId, action.elementId);
-      await locator.waitFor({ state: "visible", timeout: 10_000 });
-      await locator
-        .selectOption({ value: action.value })
-        .catch(async () => locator.selectOption({ label: action.value }));
+      await step(ctx, {
+        name: `granular_select_${action.pageId}_${action.elementId}`,
+        goal: `Choose the option matching value or label "${action.value}" in the "${action.elementId}" select on page "${action.pageId}".`,
+        context: { pageId: action.pageId, elementId: action.elementId },
+        attempt: async () => {
+          const locator = selectElement(page, action.pageId, action.elementId);
+          await locator.waitFor({ state: "visible", timeout: 10_000 });
+          await locator
+            .selectOption({ value: action.value })
+            .catch(async () => locator.selectOption({ label: action.value }));
+        },
+        alternatives: [
+          {
+            name: "select_by_label_only",
+            run: async () => {
+              const locator = selectElement(page, action.pageId, action.elementId);
+              await locator.selectOption({ label: action.value });
+            },
+          },
+        ],
+        visionAction: async (locator) => {
+          await locator
+            .selectOption({ value: action.value })
+            .catch(async () => locator.selectOption({ label: action.value }));
+        },
+      });
       return { kind: "select", ok: true };
     }
     case "navigate": {
-      await page.goto(action.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await step(ctx, {
+        name: `granular_navigate`,
+        goal: `Navigate the page to "${action.url}" and wait for DOMContentLoaded.`,
+        attempt: async () => {
+          await page.goto(action.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+        },
+        verify: async () => page.url().startsWith(action.url) || page.url().includes(action.url),
+        unrecoverable: true, // page.goto can't be vision-recovered.
+      });
       return { kind: "navigate", ok: true };
     }
     case "snapshot": {
@@ -1742,15 +1882,24 @@ async function executeAction(
       return { kind: "wait", ok: true };
     }
     case "dismissModal": {
-      if (action.modalId === "comunicadoInicial") {
-        await dismissComunicadoInicial(page);
-      } else if (action.modalId === "tourOverlay") {
-        await dismissTourOverlay(page);
-      } else if (action.modalId === "cookieBanner") {
-        await acceptAllCookies(page, visionEnabled);
-      } else if (action.modalId === "supportTerms") {
-        await acceptSupportTerms(page);
-      }
+      await step(ctx, {
+        name: `granular_dismiss_${action.modalId}`,
+        goal: `Dismiss the "${action.modalId}" modal so the underlying page becomes interactive again (no .modal-backdrop in DOM).`,
+        context: { modalId: action.modalId },
+        attempt: async () => {
+          if (action.modalId === "comunicadoInicial") {
+            await dismissComunicadoInicial(page);
+          } else if (action.modalId === "tourOverlay") {
+            await dismissTourOverlay(page);
+          } else if (action.modalId === "cookieBanner") {
+            await acceptAllCookies(page, visionEnabled);
+          } else if (action.modalId === "supportTerms") {
+            await acceptSupportTerms(page);
+          }
+        },
+        verify: async () =>
+          (await page.locator(".modal-backdrop").count().catch(() => 0)) === 0,
+      });
       return { kind: "dismissModal", ok: true };
     }
   }
