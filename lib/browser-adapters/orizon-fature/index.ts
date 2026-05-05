@@ -736,6 +736,15 @@ async function openUploadPage(
     onProgress,
   });
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
+
+  // Hard reload of the upload page before the user-driven flow begins.
+  // The portal's earlier modals (cookies, comunicado inicial, support terms)
+  // sometimes leave Bootstrap state behind — a leftover .modal-backdrop or
+  // body.modal-open — that intercepts the file input + checkbox clicks. A
+  // clean page state is cheaper and more reliable than chasing every leak.
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
+  await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
+
   await page
     .getByText(/selecione um ou mais arquivos compactados/i)
     .first()
