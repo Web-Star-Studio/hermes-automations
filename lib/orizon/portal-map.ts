@@ -274,6 +274,13 @@ const uploadTiss: PortalPage = {
         { kind: "id", id: "ngf-inputFiles" },
         { kind: "css", selector: 'input[name="inputFiles"][type="file"]' },
         { kind: "css", selector: 'input[type="file"][accept=".zip"]' },
+        // Permissive fallback: any file input on the page. The Enviar XML TISS
+        // page only ever has one file input, so this is safe and survives
+        // attribute renames by Orizon. Without this, ng-file-upload's
+        // dynamically-generated id (e.g., ngf-XXXXX) can drift across portal
+        // releases and the agent silently waits 30s for an attached element
+        // that never matches.
+        { kind: "css", selector: 'input[type="file"]' },
       ],
     },
     selectAllCheckbox: {

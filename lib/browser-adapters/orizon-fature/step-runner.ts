@@ -220,11 +220,15 @@ export async function runStep<T>(
     visionSummaries.push({ approach: `alternative "${alt.name}"`, outcome: altResult.error });
   }
 
-  // 3. Reload-before-vision: if the step opted in and the watchdog hasn't
+  // 3. Pre-escalation reload: if the step opted in and the watchdog hasn't
   // already used the reload budget, reload + retry the primary one more time
-  // before paying for vision LLM calls. Stuck-state failures (e.g., orphaned
-  // .modal-backdrop) are usually fixed by a fresh page; vision can't fix them.
-  if (reloadEnabled && !reloadAlreadyUsed && opts.visionEnabled && !step.unrecoverable) {
+  // before either paying for vision LLM calls OR escalating to a human.
+  // Stuck-state failures (e.g., orphaned .modal-backdrop, half-rendered
+  // Angular page) are almost always fixed by a fresh page — and that fix
+  // applies whether the step is vision-recoverable or not. The previous
+  // gate (`!step.unrecoverable`) was wrong: unrecoverable steps like
+  // upload_tiss_batch still benefit from a clean reload + retry.
+  if (reloadEnabled && !reloadAlreadyUsed) {
     const reloadRetry = await reloadAndRetry("pre_vision");
     if (reloadRetry.ok) {
       await opts.onProgress?.({

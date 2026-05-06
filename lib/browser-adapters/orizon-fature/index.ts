@@ -366,8 +366,14 @@ async function runFluxoCurto(
     // re-call setInputFiles after a fresh page load. unrecoverable still
     // skips the vision loop and goes straight to human recovery if reload
     // doesn't fix it.
+    //
+    // stuckAfterMs is set just above uploadTissBatch's own internal 30s
+    // waitFor — so if the inner waitFor times out at 30s and tryAndVerify
+    // returns ok=false fast, the runner falls through to the pre-escalation
+    // reload (one reload, retry primary). The watchdog only fires if
+    // something inside hangs past the inner timeout.
     recoverWithReload: true,
-    stuckAfterMs: 60_000,
+    stuckAfterMs: 45_000,
     unrecoverable: true,
   });
   await input.onProgress?.({ stage: "file_uploaded" });
