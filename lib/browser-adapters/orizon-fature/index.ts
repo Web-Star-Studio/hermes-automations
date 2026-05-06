@@ -327,6 +327,31 @@ async function runFluxoCurto(
       "Pass the buffered TISS files into the upload form's file input so the portal renders one row per file with green check marks. This is a setInputFiles call, not a click — vision cannot help here.",
     context: { pageId: "uploadTiss", elementId: "fileInput" },
     attempt: () => uploadTissBatch(page, input.tissFiles ?? []),
+    // Stronger verify than uploadTissBatch's internal checkbox count, which
+    // can match hidden Angular template elements and let the step "succeed"
+    // while no real upload happened. Confirm each file's actual name is
+    // visible in the rendered list. If any name is missing, fail fast so the
+    // runner escalates rather than letting select_all / submit operate on
+    // phantom rows.
+    verify: async () => {
+      const expected = input.tissFiles ?? [];
+      if (expected.length === 0) return true;
+      return await page
+        .evaluate((names: string[]) => {
+          const visibleText = (root: Element) => {
+            const cs = window.getComputedStyle(root);
+            if (cs.display === "none" || cs.visibility === "hidden") return "";
+            const r = (root as HTMLElement).getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return "";
+            return root.textContent ?? "";
+          };
+          const all = Array.from(document.body.querySelectorAll("*"))
+            .map(visibleText)
+            .join(" ");
+          return names.every((n) => all.includes(n));
+        }, expected.map((f) => f.fileName))
+        .catch(() => false);
+    },
     unrecoverable: true, // No vision can fix a setInputFiles failure.
   });
   await input.onProgress?.({ stage: "file_uploaded" });
@@ -736,15 +761,6 @@ async function openUploadPage(
     onProgress,
   });
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
-
-  // Hard reload of the upload page before the user-driven flow begins.
-  // The portal's earlier modals (cookies, comunicado inicial, support terms)
-  // sometimes leave Bootstrap state behind — a leftover .modal-backdrop or
-  // body.modal-open — that intercepts the file input + checkbox clicks. A
-  // clean page state is cheaper and more reliable than chasing every leak.
-  await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
-  await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
-
   await page
     .getByText(/selecione um ou mais arquivos compactados/i)
     .first()
