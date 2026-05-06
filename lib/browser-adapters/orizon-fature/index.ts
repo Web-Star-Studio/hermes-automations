@@ -110,6 +110,7 @@ export type OrizonProgressEvent =
   | { stage: "step_started"; stepName: string; goal: string }
   | { stage: "step_succeeded"; stepName: string; durationMs: number; attemptsUsed: number }
   | { stage: "step_alternative_used"; stepName: string; alternativeName: string }
+  | { stage: "step_stuck_reload"; stepName: string; reason: "watchdog" | "pre_vision" }
   | { stage: "step_unrecoverable"; stepName: string; reason: string; attemptsUsed: number }
   | { stage: "log"; message: string };
 
@@ -301,6 +302,8 @@ async function runFluxoCurto(
         .first()
         .isVisible({ timeout: 1_000 })
         .catch(() => false),
+    recoverWithReload: true,
+    stuckAfterMs: 30_000,
   });
   await input.onProgress?.({ stage: "upload_page_opened" });
 
@@ -319,6 +322,11 @@ async function runFluxoCurto(
       const noBackdrop = (await page.locator(".modal-backdrop").count().catch(() => 0)) === 0;
       return modalGone && noBackdrop;
     },
+    recoverWithReload: true,
+    // Vision retries on this step legitimately take time when the LLM is slow.
+    // Set to 90s so the watchdog only fires when the page is genuinely stuck,
+    // not during normal vision recovery.
+    stuckAfterMs: 90_000,
   });
 
   await step(ctx, {
@@ -352,7 +360,15 @@ async function runFluxoCurto(
         }, expected.map((f) => f.fileName))
         .catch(() => false);
     },
-    unrecoverable: true, // No vision can fix a setInputFiles failure.
+    // Vision can't fix a setInputFiles failure (file inputs aren't
+    // selector-locatable in a way vision can drive), but reload + retry IS
+    // safe here: the file bytes are still in `input.tissFiles`, so we can
+    // re-call setInputFiles after a fresh page load. unrecoverable still
+    // skips the vision loop and goes straight to human recovery if reload
+    // doesn't fix it.
+    recoverWithReload: true,
+    stuckAfterMs: 60_000,
+    unrecoverable: true,
   });
   await input.onProgress?.({ stage: "file_uploaded" });
 
@@ -427,6 +443,8 @@ async function runFluxoCompleto(
       "Open the 'Digitar Guia' page from the sidebar so the operadora + tipo dropdowns and the proceed button become visible.",
     context: { pageId: "dashboard" },
     attempt: () => openDigitarGuiaPage(page, visionEnabled, input.onProgress),
+    recoverWithReload: true,
+    stuckAfterMs: 30_000,
   });
   await input.onProgress?.({ stage: "digitar_guia_opened" });
   await dismissTourOverlay(page);
@@ -1448,6 +1466,8 @@ async function fillAndSaveGuide(
           return re.test(sel.options[sel.selectedIndex]?.textContent ?? "");
         }, String(guide.operadoraAns))
         .catch(() => false),
+    recoverWithReload: true,
+    stuckAfterMs: 30_000,
   });
 
   await step(ctx, {
@@ -1464,6 +1484,14 @@ async function fillAndSaveGuide(
           return sel?.value === expected;
         }, tipo.selectValue)
         .catch(() => false),
+    // NB: reload here resets the operadora dropdown above, which means the
+    // post-reload retry of just selectTipoGuia will fail (operadora not set).
+    // BUT — this is still better than spinning forever. The runner will fall
+    // through to vision recovery / human handoff, which can guide the operator
+    // to re-run from scratch. If we ever see this fire in practice, consider
+    // wrapping operadora+tipo into a single combined step.
+    recoverWithReload: true,
+    stuckAfterMs: 30_000,
   });
 
   await step(ctx, {

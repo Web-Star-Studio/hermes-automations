@@ -41,6 +41,7 @@ export type StepProgressEvent =
       attemptIndex: number;
       previousAttemptCount: number;
     }
+  | { stage: "step_stuck_reload"; stepName: string; reason: "watchdog" | "pre_vision" }
   | { stage: "step_unrecoverable"; stepName: string; reason: string; attemptsUsed: number };
 
 export type StepDescriptor<T = void> = {
@@ -66,6 +67,24 @@ export type StepDescriptor<T = void> = {
   maxVisionAttempts?: number;
   /** Skip vision and escalate straight to human recovery (e.g., file uploads). */
   unrecoverable?: boolean;
+  /**
+   * When true, the runner does ONE page reload as part of recovery — either
+   * triggered by `stuckAfterMs` during the primary attempt, or right before
+   * the vision loop if alternatives have been exhausted. After the reload, the
+   * primary attempt re-runs once. If it still fails, vision takes over.
+   *
+   * Only enable on steps where reload is safe: no in-flight portal state would
+   * be lost (e.g., before files are committed, or when the underlying form
+   * just re-pops on page load).
+   */
+  recoverWithReload?: boolean;
+  /**
+   * Watchdog timeout for the primary attempt. Requires `recoverWithReload`.
+   * If the primary doesn't return within this many ms, the runner triggers
+   * the reload+retry path. Defaults to 30_000 when recoverWithReload is true
+   * and this is unset.
+   */
+  stuckAfterMs?: number;
 };
 
 export type StepRunOptions = {
@@ -111,10 +130,59 @@ export async function runStep<T>(
   const visionSummaries: Array<{ approach: string; outcome: string }> = [];
   let lastError = "";
 
+  // At most one reload per step. Either the watchdog fires it during the
+  // primary attempt, or we trigger it ourselves before the vision loop —
+  // whichever happens first wins. Set to true once used to avoid reloading
+  // twice (which would burn time and could lose newly built page state).
+  let reloadAlreadyUsed = false;
+  const reloadEnabled = step.recoverWithReload === true;
+  const watchdogMs = reloadEnabled ? step.stuckAfterMs ?? 30_000 : null;
+
   await opts.onProgress?.({ stage: "step_started", stepName: step.name, goal: step.goal });
 
-  // 1. Deterministic primary attempt.
-  const primary = await tryAndVerify(step.attempt, step.verify, "deterministic primary");
+  async function reloadAndRetry(reason: "watchdog" | "pre_vision") {
+    reloadAlreadyUsed = true;
+    await opts.onProgress?.({ stage: "step_stuck_reload", stepName: step.name, reason });
+    await opts.page
+      .reload({ waitUntil: "domcontentloaded", timeout: 30_000 })
+      .catch(() => undefined);
+    await opts.page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
+    return await tryAndVerify(
+      step.attempt,
+      step.verify,
+      reason === "watchdog" ? "post-watchdog reload retry" : "pre-vision reload retry",
+    );
+  }
+
+  // 1. Deterministic primary attempt — wrapped in a watchdog when the step
+  // opted in via recoverWithReload. If the attempt hangs past stuckAfterMs,
+  // we abandon it (the operation continues running against a stale page after
+  // reload, but its result is ignored), reload, and retry the attempt once.
+  let primary: { ok: true; value: T } | { ok: false; error: string };
+  if (watchdogMs !== null) {
+    const raceOutcome = await Promise.race([
+      tryAndVerify(step.attempt, step.verify, "deterministic primary").then(
+        (r) => ({ kind: "result" as const, r }),
+      ),
+      new Promise<{ kind: "stuck" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "stuck" }), watchdogMs),
+      ),
+    ]);
+    if (raceOutcome.kind === "result") {
+      primary = raceOutcome.r;
+    } else {
+      // Watchdog fired — attempt hung past the budget. Reload + retry.
+      visionSummaries.push({
+        approach: "deterministic primary",
+        outcome: `watchdog: attempt did not complete within ${watchdogMs}ms`,
+      });
+      lastError = `watchdog: attempt did not complete within ${watchdogMs}ms`;
+      primary = await reloadAndRetry("watchdog");
+    }
+  } else {
+    primary = await tryAndVerify(step.attempt, step.verify, "deterministic primary");
+  }
+
   if (primary.ok) {
     await opts.onProgress?.({
       stage: "step_succeeded",
@@ -125,7 +193,10 @@ export async function runStep<T>(
     return primary.value;
   }
   lastError = primary.error;
-  visionSummaries.push({ approach: "deterministic primary", outcome: primary.error });
+  visionSummaries.push({
+    approach: reloadAlreadyUsed ? "post-watchdog reload retry" : "deterministic primary",
+    outcome: primary.error,
+  });
 
   // 2. Pre-defined alternatives.
   const alternatives = step.alternatives ?? [];
@@ -149,7 +220,26 @@ export async function runStep<T>(
     visionSummaries.push({ approach: `alternative "${alt.name}"`, outcome: altResult.error });
   }
 
-  // 3. Vision loop with feedback. Each retry tells the LLM what previous attempts
+  // 3. Reload-before-vision: if the step opted in and the watchdog hasn't
+  // already used the reload budget, reload + retry the primary one more time
+  // before paying for vision LLM calls. Stuck-state failures (e.g., orphaned
+  // .modal-backdrop) are usually fixed by a fresh page; vision can't fix them.
+  if (reloadEnabled && !reloadAlreadyUsed && opts.visionEnabled && !step.unrecoverable) {
+    const reloadRetry = await reloadAndRetry("pre_vision");
+    if (reloadRetry.ok) {
+      await opts.onProgress?.({
+        stage: "step_succeeded",
+        stepName: step.name,
+        durationMs: Date.now() - startedAt,
+        attemptsUsed: 2 + alternatives.length,
+      });
+      return reloadRetry.value;
+    }
+    lastError = reloadRetry.error;
+    visionSummaries.push({ approach: "pre-vision reload retry", outcome: reloadRetry.error });
+  }
+
+  // 4. Vision loop with feedback. Each retry tells the LLM what previous attempts
   // tried and why they failed so it can self-correct.
   if (opts.visionEnabled && !step.unrecoverable) {
     const maxAttempts = step.maxVisionAttempts ?? 3;
@@ -180,8 +270,12 @@ export async function runStep<T>(
     }
   }
 
-  // 4. Escalate to human recovery.
-  const attemptsUsed = 1 + alternatives.length + (opts.visionEnabled && !step.unrecoverable ? (step.maxVisionAttempts ?? 3) : 0);
+  // 5. Escalate to human recovery.
+  const attemptsUsed =
+    1 +
+    alternatives.length +
+    (reloadAlreadyUsed ? 1 : 0) +
+    (opts.visionEnabled && !step.unrecoverable ? step.maxVisionAttempts ?? 3 : 0);
   await opts.onProgress?.({
     stage: "step_unrecoverable",
     stepName: step.name,

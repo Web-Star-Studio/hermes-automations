@@ -14,7 +14,7 @@ import type { ElementLocation, FindElementWithVisionInput } from "@/lib/ai/visio
 // The runner takes Page only to grab screenshots and build locators on vision
 // recovery. Tests stub both with no-ops; the screenshot Buffer is opaque to
 // `findElementWithVision` mocks.
-function fakePage(): Page {
+function fakePage(reloadSpy?: ReturnType<typeof vi.fn>): Page {
   const stubLocator = {
     click: vi.fn(async () => undefined),
     first: () => stubLocator,
@@ -24,6 +24,8 @@ function fakePage(): Page {
     screenshot: vi.fn(async () => Buffer.from("png")),
     locator: () => stubLocator,
     getByText: () => stubLocator,
+    reload: reloadSpy ?? vi.fn(async () => undefined),
+    waitForLoadState: vi.fn(async () => undefined),
   } as unknown as Page;
 }
 
@@ -266,5 +268,82 @@ describe("runStep", () => {
 
     expect(visionFn).not.toHaveBeenCalled();
     expect(recovery).toHaveBeenCalledTimes(1);
+  });
+
+  it("reloads the page once before vision when recoverWithReload is true and the primary fails fast", async () => {
+    const events: StepProgressEvent[] = [];
+    const reloadSpy = vi.fn(async () => undefined);
+    let attemptCalls = 0;
+    let postReload = false;
+
+    const visionFn = vi.fn(noopVision);
+    const step: StepDescriptor<void> = {
+      name: "stuck_modal_backdrop",
+      goal: "Click Enviar.",
+      attempt: async () => {
+        attemptCalls++;
+        // First call fails (verify will reject); after reload the second
+        // call sees postReload=true and the verify accepts.
+        if (attemptCalls > 1) postReload = true;
+      },
+      verify: async () => postReload,
+      recoverWithReload: true,
+    };
+
+    await runStep(step, {
+      page: fakePage(reloadSpy),
+      jobId: "job-7",
+      visionEnabled: true,
+      onProgress: captureProgress(events),
+      awaitHumanRecovery: noopRecovery,
+      findElementWithVision: visionFn,
+    });
+
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    expect(attemptCalls).toBe(2); // primary + post-reload retry
+    expect(visionFn).not.toHaveBeenCalled();
+    const reloadEvent = events.find((e) => e.stage === "step_stuck_reload");
+    expect(reloadEvent).toBeDefined();
+    if (reloadEvent && reloadEvent.stage === "step_stuck_reload") {
+      expect(reloadEvent.reason).toBe("pre_vision");
+    }
+  });
+
+  it("the watchdog reloads + retries when the primary attempt hangs past stuckAfterMs", async () => {
+    const events: StepProgressEvent[] = [];
+    const reloadSpy = vi.fn(async () => undefined);
+    let attemptCalls = 0;
+
+    const step: StepDescriptor<void> = {
+      name: "watchdog_reload",
+      goal: "Click something.",
+      attempt: async () => {
+        attemptCalls++;
+        if (attemptCalls === 1) {
+          // First call hangs forever — watchdog should fire.
+          await new Promise((resolve) => setTimeout(resolve, 10_000));
+        }
+        // Second call (post-reload retry) returns immediately.
+      },
+      verify: async () => attemptCalls >= 2,
+      recoverWithReload: true,
+      stuckAfterMs: 50, // tiny so the test runs fast
+    };
+
+    await runStep(step, {
+      page: fakePage(reloadSpy),
+      jobId: "job-8",
+      visionEnabled: true,
+      onProgress: captureProgress(events),
+      awaitHumanRecovery: noopRecovery,
+      findElementWithVision: vi.fn(noopVision),
+    });
+
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    const reloadEvent = events.find((e) => e.stage === "step_stuck_reload");
+    expect(reloadEvent).toBeDefined();
+    if (reloadEvent && reloadEvent.stage === "step_stuck_reload") {
+      expect(reloadEvent.reason).toBe("watchdog");
+    }
   });
 });

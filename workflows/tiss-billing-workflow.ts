@@ -871,6 +871,7 @@ const submitProgressMessages: Record<string, string> = {
   step_started: "Etapa iniciada.",
   step_succeeded: "Etapa concluída.",
   step_alternative_used: "Tentativa alternativa de etapa.",
+  step_stuck_reload: "Etapa travada — recarregando página antes de tentar novamente.",
   step_unrecoverable: "Etapa irrecuperável — aguardando operador.",
   log: "Log do adaptador Orizon.",
 };
@@ -915,9 +916,14 @@ async function emitSubmitProgress(
     event.stage === "step_started" ||
     event.stage === "step_succeeded" ||
     event.stage === "step_alternative_used" ||
+    event.stage === "step_stuck_reload" ||
     event.stage === "step_unrecoverable"
   ) {
     payload.stepName = event.stepName;
+  }
+  if (event.stage === "step_stuck_reload") {
+    payload.reason = event.reason;
+    payload.status = "running";
   }
   if (event.stage === "step_started") {
     payload.goal = event.goal;
